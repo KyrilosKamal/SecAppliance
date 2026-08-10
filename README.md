@@ -1,6 +1,8 @@
-# SecAppliance - Network & Vulnerability Assessment Appliance
+# SecAppliance - Network & Vulnerability Assessment Appliance (Fully Unlocked / License-Free)
 
-**SecAppliance** is an enterprise-grade, lightweight, and high-performance network scanner and vulnerability collection appliance. Designed for IT Administrators, SOC Analysts, and Security Auditors, it automates network discovery, service versioning, offline CVE correlation, and executive report generation—with support for both unauthenticated network scans and deep credentialed audits (via WinRM/SSH).
+**SecAppliance** is an enterprise-grade, lightweight, and high-performance network scanner and vulnerability collection appliance. Designed for IT Administrators, SOC Analysts, and Security Auditors, it automates network discovery, service versioning, offline CVE correlation, and executive report generation—with support for both unauthenticated network scans and deep credentialed audits (via WinRM/SSH). 
+
+> **Notice:** The license verification and activation system has been completely removed. All core features, advanced inspection capabilities, and reporting engines are now fully unlocked and ready for use out-of-the-box.
 
 ---
 
@@ -9,7 +11,7 @@
 * **Asynchronous & Concurrent Scanning:** Built using Python's `asyncio` to execute fast, parallel host discovery and port scanning across entire `/24` subnets or IP ranges.
 * **Offline Vulnerability Mapping (CVE Lookup):** Automatically maps detected open ports and banners against a localized database of critical vulnerabilities (CVE IDs, CVSS severity, and summaries).
 * **Dynamic Remediation Engine:** Rule-based security scoring that generates actionable recommendations with visual severity badges (HIGH / MEDIUM / LOW) based on exposure (LAN vs. WAN).
-*  **Flexible Authentication Modes:**
+* **Flexible Authentication Modes:**
   * **Unauthenticated Mode (Default):** Runs port scans, service/banner identification, CVE mapping, and report generation without requiring target credentials.
   * **Credentialed Audit Mode (Optional):** Utilizes WinRM or SSH to perform deep target inspection—extracting active network sockets, process IDs (PIDs), and process names directly from target operating systems.
 * **Executive HTML Reporting:** Standardizes all outputs into interactive, beautifully styled HTML reports automatically stored inside the `reports/` directory.
@@ -70,7 +72,7 @@ python main.py scan [FLAGS]
 Scans an entire `/24` subnet for open ports and banners without needing credentials, performing CVE mapping and generating an HTML executive report.
 
 ```bash
-python main.py scan -t ip_address/subnet_mask --ports 80,445,3389,5985 -v
+python main.py scan -t 10.30.10.0/24 --ports 80,445,3389,5985 -v
 
 ```
 
@@ -97,7 +99,7 @@ python main.py scan -t ip_address -u "admin_user" -P "Password" --auth-type winr
 Saves the generated assessment report into a custom folder:
 
 ```bash
-python main.py scan -t ip_address/subnet_mask -o my_custom_reports/
+python main.py scan -t 10.30.10.0/24 -o my_custom_reports/
 
 ```
 
@@ -108,18 +110,18 @@ python main.py scan -t ip_address/subnet_mask -o my_custom_reports/
 ```text
 SecAppliance/
 ├── core/
-│   ├── network_scanner.py   # Asynchronous host discovery & port scanning engine
-│   ├── remote_collector.py  # Credentialed WinRM/SSH deep data collector
-│   ├── vuln_lookup.py       # Localized CVE & vulnerability correlation engine
-│   └── report_generator.py  # Dynamic HTML executive report builder
+│   ├── network_scanner.py    # Asynchronous host discovery & port scanning engine
+│   ├── remote_collector.py   # Credentialed WinRM/SSH deep data collector
+│   ├── vuln_lookup.py        # Localized CVE & vulnerability correlation engine
+│   └── report_generator.py   # Dynamic HTML executive report builder
 ├── utils/
-│   └── net_utils.py        # TCP state mappers, RFC 1918 IP classifier (LAN/WAN)
+│   └── net_utils.py          # TCP state mappers, RFC 1918 IP classifier (LAN/WAN)
 ├── reporting/
-│   └── templates/           # HTML executive report templates
-├── reports/                 # Default directory for generated audit reports
-├── main.py                  # CLI entrypoint and argument parser
-├── requirements.txt         # Project dependencies
-└── README.md                # Project documentation
+│   └── templates/            # HTML executive report templates
+├── reports/                  # Default directory for generated audit reports
+├── main.py                   # CLI entrypoint and argument parser
+├── requirements.txt          # Project dependencies
+└── README.md                 # Project documentation
 
 ```
 
@@ -133,4 +135,4 @@ This software is designed for legitimate security auditing, network maintenance,
 
 ## License
 
-This project is licensed under the [MIT License](https://www.google.com/search?q=LICENSE).
+This project is open-source and provided under the MIT License (Free of any commercial license restrictions or activation keys).
