@@ -1,8 +1,6 @@
-# SecAppliance - Network & Vulnerability Assessment Appliance (Fully Unlocked / License-Free)
+# SecAppliance - Network & Vulnerability Assessment Appliance
 
 **SecAppliance** is an enterprise-grade, lightweight, and high-performance network scanner and vulnerability collection appliance. Designed for IT Administrators, SOC Analysts, and Security Auditors, it automates network discovery, service versioning, offline CVE correlation, and executive report generation—with support for both unauthenticated network scans and deep credentialed audits (via WinRM/SSH). 
-
-> **Notice:** The license verification and activation system has been completely removed. All core features, advanced inspection capabilities, and reporting engines are now fully unlocked and ready for use out-of-the-box.
 
 ---
 
