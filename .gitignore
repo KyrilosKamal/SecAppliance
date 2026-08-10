@@ -1,0 +1,10 @@
+data/*.db
+reports/
+*.log
+__pycache__/
+.venv/
+.pytest_cache
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
