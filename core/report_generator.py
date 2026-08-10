@@ -1,0 +1,374 @@
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+from jinja2 import Environment, FileSystemLoader
+import asyncio
+import logging
+
+from utils.logger import logger
+from core.vuln_lookup import get_vulns_for_service
+
+def resource_path(relative_path: str = "") -> Path:
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        base_path = Path(sys._MEIPASS)
+    else:
+        # Resolve path relative to project root
+        base_path = Path(__file__).parent.parent
+    return base_path / relative_path
+
+class HTMLReportGenerator:
+    def __init__(self, db_manager, template_dir: str = "reporting/templates", reports_dir: str = "reports"):
+        """
+        Initialize the HTML report generator.
+
+        Args:
+            db_manager: Instance of DatabaseManager for database operations.
+            template_dir: Directory containing Jinja2 templates and static assets.
+            reports_dir: Directory to save generated reports.
+        """
+        self.db = db_manager
+        # Use resource_path to handle both development and PyInstaller bundles
+        base_path = resource_path("")
+        self.template_dir = base_path / template_dir
+        self.reports_dir = Path(reports_dir)
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
+
+        # Set up Jinja2 environment
+        self.env = Environment(
+            loader=FileSystemLoader(str(self.template_dir)),
+            autoescape=True
+        )
+
+    async def _get_scan_data(self, scan_id: int) -> dict:
+        """
+        Retrieve scan information from the database.
+
+        Args:
+            scan_id: The ID of the scan to retrieve.
+
+        Returns:
+            Dictionary containing scan details.
+        """
+        scan = await self.db.get_scan(scan_id)
+        if not scan:
+            raise ValueError(f"Scan with ID {scan_id} not found.")
+        return scan
+
+    async def _get_hosts_data(self, scan_id: int) -> list:
+        """
+        Retrieve host information for a given scan.
+
+        Args:
+            scan_id: The ID of the scan.
+
+        Returns:
+            List of dictionaries containing host details.
+        """
+        query = """
+            SELECT h.id, h.ip_address, h.hostname, h.is_alive,
+                   COUNT(p.id) as open_ports_count,
+                   GROUP_CONCAT(p.port_number || '/' || p.protocol, ', ') as open_ports_list
+            FROM hosts h
+            LEFT JOIN ports p ON h.id = p.host_id
+            WHERE h.scan_id = ?
+            GROUP BY h.id, h.ip_address, h.hostname, h.is_alive
+        """
+        cursor = await self.db.connection.execute(query, (scan_id,))
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": row[0],
+                "ip_address": row[1],
+                "hostname": row[2],
+                "is_alive": bool(row[3]),
+                "open_ports_count": row[4],
+                "open_ports_list": row[5] if row[5] else ""
+            }
+            for row in rows
+        ]
+
+    async def _get_vulnerabilities_data(self, scan_id: int) -> tuple:
+        """
+        Retrieve vulnerability information for a given scan.
+
+        Args:
+            scan_id: The ID of the scan.
+
+        Returns:
+            Tuple of (grouped_vulnerabilities_by_host, flat_vulnerabilities_list)
+        """
+        query = """
+            SELECT v.title, v.severity, v.description, v.remediation, h.ip_address, v.port, v.protocol
+            FROM vulnerabilities v
+            JOIN hosts h ON v.host_id = h.id
+            WHERE h.scan_id = ?
+        """
+        cursor = await self.db.connection.execute(query, (scan_id,))
+        rows = await cursor.fetchall()
+
+        # Group by host
+        vulnerabilities_by_host = {}
+        flat_vulnerabilities = []
+
+        for row in rows:
+            vuln_data = {
+                "title": row[0],
+                "severity": row[1],
+                "description": row[2] or "No description provided.",
+                "remediation": row[3] or "No remediation provided.",
+                "ip_address": row[4],
+                "port": row[5],
+                "protocol": row[6]
+            }
+            flat_vulnerabilities.append(vuln_data)
+
+            ip_address = row[4]
+            if ip_address not in vulnerabilities_by_host:
+                vulnerabilities_by_host[ip_address] = []
+            vulnerabilities_by_host[ip_address].append(vuln_data)
+
+        return vulnerabilities_by_host, flat_vulnerabilities
+
+    async def _get_active_connections_data(self, scan_id: int) -> tuple:
+        """
+        Retrieve active network connections for a given scan and their collection status.
+        """
+        try:
+            cursor = await self.db.connection.execute(
+                "SELECT local_address, remote_address, remote_classification, pid, process_name, status, collection_status FROM active_connections WHERE scan_id = ?",
+                (scan_id,)
+            )
+            rows = await cursor.fetchall()
+            connections = [
+                {
+                    "local_address": row[0],
+                    "remote_address": row[1],
+                    "remote_classification": row[2],
+                    "pid": row[3],
+                    "process_name": row[4],
+                    "status": row[5],
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                for row in rows if row[6] == "success"
+            ]
+            
+            # Check if any failure/skip occurred
+            collection_status = "success"
+            if any(row[6] != "success" for row in rows):
+                 collection_status = "failed"
+            elif not rows:
+                 collection_status = "no_data"
+            
+            return connections, collection_status
+        except Exception as e:
+            logger.error(f"Failed to retrieve active connections for scan {scan_id}: {e}")
+            return [], "error"
+
+    async def _prepare_template_data(self, scan_id: int) -> dict:
+        """
+        Prepare all data needed for the report template.
+
+        Args:
+            scan_id: The ID of the scan to generate a report for.
+
+        Returns:
+            Dictionary containing all data for the template.
+        """
+        # Get basic data
+        scan_data = await self._get_scan_data(scan_id)
+        hosts_data = await self._get_hosts_data(scan_id)
+        vulnerabilities_by_host, flat_vulnerabilities = await self._get_vulnerabilities_data(scan_id)
+        active_connections, conn_status = await self._get_active_connections_data(scan_id)
+        port_data = await self.db.get_ports(scan_id)
+
+        # Calculate summary statistics
+        total_hosts = len(hosts_data)
+        total_open_ports = sum(h['open_ports_count'] for h in hosts_data)
+        total_vulnerabilities = len(flat_vulnerabilities)
+
+        # Calculate vulnerability breakdown by severity
+        vuln_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for vuln in flat_vulnerabilities:
+            severity = vuln["severity"].upper()  # Convert to uppercase for counting
+            if severity in vuln_counts:
+                vuln_counts[severity] += 1
+            else:
+                # Default to INFO for unknown severities
+                vuln_counts["INFO"] += 1
+
+        # Calculate percentages for vulnerability breakdown chart
+        vulnerability_breakdown = {}
+        for severity, count in vuln_counts.items():
+            if total_vulnerabilities > 0:
+                percentage = round((count / total_vulnerabilities) * 100, 1)
+            else:
+                percentage = 0.0
+
+            # Map severity to color
+            color_map = {
+                "CRITICAL": "#EF4444",
+                "HIGH": "#F97316",
+                "MEDIUM": "#F59E0B",
+                "LOW": "#10B981",
+                "INFO": "#0EA5E9"
+            }
+
+            vulnerability_breakdown[severity] = {
+                "count": count,
+                "percentage": percentage,
+                "color": color_map.get(severity, "#6B7280")
+            }
+
+        # 1. Populate Recommendations & CVE Findings First
+        recommendations = []
+        cve_findings = []
+        for port_info in port_data:
+            port = port_info['port']
+            banner = port_info['banner']
+            service = port_info['service_name']
+            
+            # CVE Lookup
+            vulns = get_vulns_for_service(service, banner)
+            for v in vulns:
+                cve_findings.append({
+                    "ip": port_info['ip_address'],
+                    "service": f"{service} ({banner})",
+                    "cve": v['cve'],
+                    "severity": v['severity'],
+                    "remediation": v['remediation']
+                })
+
+            if port == 445:
+                recommendations.append({"severity": "HIGH", "title": "SMB Exposure", "description": "SMB (Port 445) is exposed. Restrict to internal networks and disable SMBv1."})
+            elif port == 3389:
+                recommendations.append({"severity": "HIGH", "title": "RDP Exposure", "description": "RDP (Port 3389) is exposed. Enforce MFA, use VPN access, or NLA."})
+            elif port in [80, 5985, 5986]:
+                recommendations.append({"severity": "MEDIUM", "title": f"Service Exposure (Port {port})", "description": f"Service on Port {port} is exposed. Enforce HTTPS/TLS and restrict remote access."})
+
+        # 2. Extract All Severities (Vulnerabilities + Recommendations)
+        all_severities = []
+        for host_ip, vulns in vulnerabilities_by_host.items():
+            for vuln in vulns:
+                all_severities.append(vuln.get("severity", "LOW").upper())
+        for rec in recommendations:
+            all_severities.append(rec.get("severity", "LOW").upper())
+
+        # 3. Determine Highest Severity & Dynamic Risk Metrics
+        risk_level = "Low"
+        risk_score = 10
+        risk_percentage = 10
+        risk_grade = "A"
+
+        # Check if any findings exist (vulnerabilities + recommendations)
+        if total_vulnerabilities > 0 or recommendations:
+            if "CRITICAL" in all_severities:
+                risk_score = 95
+                risk_percentage = 95
+                risk_grade = "F"
+                risk_level = "Critical"
+            elif "HIGH" in all_severities:
+                risk_score = 75
+                risk_percentage = 75
+                risk_grade = "D"
+                risk_level = "High"
+            elif "MEDIUM" in all_severities:
+                risk_score = 50
+                risk_percentage = 50
+                risk_grade = "C"
+                risk_level = "Medium"
+            else:
+                # Vulnerabilities/Recommendations exist, but only Low severity
+                risk_score = 25
+                risk_percentage = 25
+                risk_grade = "B"
+                risk_level = "Low"
+        else:
+            # Zero findings
+            risk_score = 10
+            risk_percentage = 10
+            risk_grade = "A"
+            risk_level = "Low"
+
+        # Calculate scan duration
+        scan_start = datetime.fromisoformat(scan_data["start_time"].replace("Z", "+00:00"))
+        scan_end = datetime.fromisoformat(scan_data["end_time"].replace("Z", "+00:00")) if scan_data["end_time"] else datetime.now()
+        scan_duration_delta = scan_end - scan_start
+
+        # Format duration as HH:MM:SS or MM:SS
+        total_seconds = int(scan_duration_delta.total_seconds())
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+
+        if hours > 0:
+            scan_duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        else:
+            scan_duration = f"{minutes:02d}:{seconds:02d}"
+
+        # Prepare template data
+        template_data = {
+            "scan_id": scan_id,
+            "target_range": scan_data["target_range"],
+            "scan_date": scan_data["start_time"][:10] if scan_data["start_time"] else "Unknown",
+            "total_hosts": total_hosts,
+            "total_open_ports": total_open_ports,
+            "total_vulnerabilities": total_vulnerabilities,
+            "risk_level": risk_level,
+            "risk_grade": risk_grade,
+            "risk_score": risk_score,
+            "risk_percentage": risk_percentage,  # For the gauge display (same value as risk_score)
+            "vulnerability_breakdown": vulnerability_breakdown,
+            "scan_duration": scan_duration,
+            "hosts": hosts_data,
+            "vulnerabilities_by_host": vulnerabilities_by_host,
+            "active_connections": active_connections,
+            "connection_status": conn_status,
+            "ports": port_data,
+            "cve_findings": cve_findings,
+            "recommendations": recommendations,
+            "report_generated_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "assessor": "SecAppliance Automated Scanner"
+        }
+
+        return template_data
+
+    async def generate_report(self, scan_id: int) -> str:
+        """
+        Generate an HTML report for the specified scan ID.
+
+        Args:
+            scan_id: The ID of the scan to generate a report for.
+
+        Returns:
+            The file path of the generated HTML report.
+        """
+        try:
+            # Prepare data for the template
+            template_data = await self._prepare_template_data(scan_id)
+
+            # Read CSS content for embedding (works both in dev and when frozen)
+            css_path = resource_path("reporting/templates/style.css")
+            with open(css_path, "r", encoding="utf-8") as f:
+                css_content = f.read()
+
+            # Add CSS content to template data
+            template_data["css_content"] = css_content
+
+            # Load and render the template
+            template = self.env.get_template("executive_report.html")
+            html_content = template.render(**template_data)
+
+            # Define output file path
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            html_path = self.reports_dir / f"Report_{scan_id}_{timestamp}.html"
+
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            logger.info(f"HTML report generated: {html_path}")
+            return str(html_path)
+
+        except Exception as e:
+            logger.error(f"Failed to generate report for scan {scan_id}: {e}")
+            raise

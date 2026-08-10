@@ -1,0 +1,10 @@
+aiohttp
+jinja2
+weasyprint
+typer
+colorama
+aiosqlite
+scapy
+psutil
+paramiko
+pywinrm

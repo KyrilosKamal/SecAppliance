@@ -1,0 +1,96 @@
+{
+  "headers": [
+    {
+      "name": "Strict-Transport-Security",
+      "severity": "Medium",
+      "description": "HTTP Strict Transport Security (HSTS) is not set, which could allow SSL stripping attacks.",
+      "remediation": "Configure your web server to include the Strict-Transport-Security header with a max-age of at least 31536000 seconds (1 year)."
+    },
+    {
+      "name": "X-Frame-Options",
+      "severity": "Medium",
+      "description": "X-Frame-Options header is missing, which could allow clickjacking attacks.",
+      "remediation": "Configure your web server to include the X-Frame-Options header with value DENY or SAMEORIGIN."
+    },
+    {
+      "name": "X-Content-Type-Options",
+      "severity": "Low",
+      "description": "X-Content-Type-Options header is missing, which could lead to MIME type sniffing attacks.",
+      "remediation": "Configure your web server to include the X-Content-Type-Options header with value nosniff."
+    },
+    {
+      "name": "Content-Security-Policy",
+      "severity": "High",
+      "description": "Content-Security-Policy header is missing, which could allow cross-site scripting (XSS) and other code injection attacks.",
+      "remediation": "Implement a Content Security Policy to restrict the sources of content that can be loaded on your web pages."
+    },
+    {
+      "name": "Server",
+      "severity": "Low",
+      "description": "Server header reveals potentially sensitive information about the web server technology and version.",
+      "remediation": "Configure your web server to remove or obfuscate the Server header."
+    }
+  ],
+  "ports": [
+    {
+      "port": 445,
+      "protocol": "tcp",
+      "severity": "High",
+      "description": "SMB (Server Message Block) service is exposed, which is often targeted by ransomware and lateral movement attacks.",
+      "remediation": "Block SMB (port 445) from untrusted networks and ensure SMBv1 is disabled. Use a firewall to restrict access to trusted networks only."
+    },
+    {
+      "port": 3389,
+      "protocol": "tcp",
+      "severity": "High",
+      "description": "Remote Desktop Protocol (RDP) is exposed, which is a common target for brute-force attacks and ransomware.",
+      "remediation": "Use Network Level Authentication (NLA), restrict RDP access via VPN or firewall, and consider using a jump host or zero-trust network access."
+    },
+    {
+      "port": 135,
+      "protocol": "tcp",
+      "severity": "Medium",
+      "description": "Microsoft RPC endpoint mapper is exposed, which can be used for reconnaissance and exploitation.",
+      "remediation": "Block port 135 from untrusted networks and restrict RPC services to internal networks only."
+    },
+    {
+      "port": 139,
+      "protocol": "tcp",
+      "severity": "Medium",
+      "description": "NetBIOS session service is exposed, which can leak sensitive information and facilitate SMB attacks.",
+      "remediation": "Disable NetBIOS or restrict access to trusted networks. Consider disabling SMBv1 and using SMBv2 or higher with encryption."
+    }
+  ],
+  "ssl_errors": [
+    {
+      "type": "expired_certificate",
+      "severity": "High",
+      "description": "SSL certificate has expired and is no longer valid.",
+      "remediation": "Renew the SSL certificate immediately."
+    },
+    {
+      "type": "self_signed_certificate",
+      "severity": "Medium",
+      "description": "The SSL certificate is self-signed, which is not trusted by browsers.",
+      "remediation": "Replace the self-signed certificate with one from a trusted Certificate Authority."
+    },
+    {
+      "type": "hostname_mismatch",
+      "severity": "Medium",
+      "description": "SSL certificate hostname does not match the server hostname.",
+      "remediation": "Ensure the SSL certificate matches the domain name being used or update the certificate to include the correct hostnames."
+    },
+    {
+      "type": "weak_cipher",
+      "severity": "Medium",
+      "description": "SSL/TLS configuration uses weak ciphers that are considered weak.",
+      "remediation": "Configure the server to use only strong cipher suites and disable weak ones."
+    },
+    {
+      "type": "untrusted_issuer",
+      "severity": "Medium",
+      "description": "SSL certificate is issued by an unknown or untrusted Certificate Authority.",
+      "remediation": "Install the proper intermediate certificates or use a certificate from a trusted CA."
+    }
+  ]
+}

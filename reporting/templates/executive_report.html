@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SecAppliance Security Report - Scan {{ scan_id }}</title>
+    <style>{{ css_content }}</style>
+</head>
+<body>
+    <div class="report">
+        <!-- Enterprise Header & Branding -->
+        <header class="report-header">
+            <div class="header-content">
+                <div class="logo">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                </div>
+                <div class="header-text">
+                    <h1 class="report-title">Security Assessment Report</h1>
+                    <div class="header-meta">
+                        <div class="meta-item">
+                            <span class="meta-label">Target:</span>
+                            <span class="meta-value">{{ target_range }}</span>
+                        </div>
+                        <div class="meta-item">
+                            <span class="meta-label">Date:</span>
+                            <span class="meta-value">{{ scan_date }}</span>
+                        </div>
+                        <div class="meta-item">
+                            <span class="meta-label">Scan ID:</span>
+                            <span class="meta-value">{{ scan_id }}</span>
+                        </div>
+                        <div class="meta-item">
+                            <span class="meta-label">Assessor:</span>
+                            <span class="meta-value">{{ assessor }}</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Executive Summary Dashboard -->
+        <section class="executive-summary">
+            <!-- Risk Assessment Box -->
+            <div class="risk-assessment">
+                <div class="risk-badge-container">
+                    <div class="risk-badge risk-{{ risk_level|lower }}">{{ risk_grade }}</div>
+                    <div>
+                        <div class="risk-level">Risk Level</div>
+                        <div class="risk-gauge">
+                            <div class="gauge-track">
+                                <div class="gauge-fill" style="width: {{ risk_percentage }}%;"></div>
+                            </div>
+                            <div class="gauge-label">Risk Score: {{ risk_score }}/100</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- KPI Metrics Strip -->
+            <div class="kpi-strip">
+                <div class="kpi-item">
+                    <div class="kpi-icon hosts">🖥️</div>
+                    <div class="kpi-value">{{ total_hosts }}</div>
+                    <div class="kpi-label">Hosts Scanned</div>
+                </div>
+                <div class="kpi-divider"></div>
+                <div class="kpi-item">
+                    <div class="kpi-icon ports">🔌</div>
+                    <div class="kpi-value">{{ total_open_ports }}</div>
+                    <div class="kpi-label">Open Ports</div>
+                </div>
+                <div class="kpi-divider"></div>
+                <div class="kpi-item">
+                    <div class="kpi-icon vulns">⚠️</div>
+                    <div class="kpi-value">{{ total_vulnerabilities }}</div>
+                    <div class="kpi-label">Total Vulnerabilities</div>
+                </div>
+                <div class="kpi-divider"></div>
+                <div class="kpi-item">
+                    <div class="kpi-icon duration">⏱</div>
+                    <div class="kpi-value">{{ scan_duration }}</div>
+                    <div class="kpi-label">Scan Duration</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Open Ports & Services -->
+        <section class="ports-details">
+            <h2 class="section-title">Open Ports & Target Services</h2>
+            {% if ports %}
+            <div class="traffic-container">
+                <table class="traffic-table">
+                    <thead>
+                        <tr>
+                            <th>Port Number</th>
+                            <th>Protocol</th>
+                            <th>Service Name</th>
+                            <th>State</th>
+                            <th>Target</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for port in ports %}
+                        <tr>
+                            <td>{{ port.port }}</td>
+                            <td>{{ port.protocol|upper }}</td>
+                            <td>{{ port.service_name }}</td>
+                            <td>Open</td>
+                            <td>{{ port.ip_address }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p>No open ports detected.</p>
+            {% endif %}
+        </section>
+
+        <!-- Security Recommendations -->
+        <section class="recommendations">
+            <h2 class="section-title">Security Recommendations & Remediation</h2>
+            {% if recommendations %}
+            <div class="findings-container">
+                {% for rec in recommendations %}
+                <div class="finding-card">
+                    <div class="finding-header">
+                        <h3 class="finding-title">{{ rec.title }}</h3>
+                        <div class="finding-meta">
+                            <span class="severity-tag severity-{{ rec.severity|lower }}">{{ rec.severity }}</span>
+                        </div>
+                    </div>
+                    <div class="finding-body">
+                        <p>{{ rec.description }}</p>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <p>No specific recommendations identified based on current findings.</p>
+            {% endif %}
+        </section>
+
+        <!-- CVE Findings -->
+        <section class="cve-details">
+            <h2 class="section-title">Discovered Vulnerabilities & CVE Mapping</h2>
+            {% if cve_findings %}
+            <div class="traffic-container">
+                <table class="traffic-table">
+                    <thead>
+                        <tr>
+                            <th>Target IP</th>
+                            <th>Service/Version</th>
+                            <th>CVE ID</th>
+                            <th>Severity</th>
+                            <th>Remediation</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for cve in cve_findings %}
+                        <tr>
+                            <td>{{ cve.ip }}</td>
+                            <td>{{ cve.service }}</td>
+                            <td>{{ cve.cve }}</td>
+                            <td><span class="severity-tag severity-{{ cve.severity|lower }}">{{ cve.severity }}</span></td>
+                            <td>{{ cve.remediation }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p>No CVE-related vulnerabilities detected based on service versions.</p>
+            {% endif %}
+        </section>
+
+        <!-- Infrastructure & Vulnerability Tables -->
+        {% if vulnerabilities_by_host %}
+        <section class="vulnerability-details">
+            <h2 class="section-title">Technical Findings</h2>
+            <div class="findings-container">
+                {% for host_ip, vulns in vulnerabilities_by_host.items() %}
+                {% for vuln in vulns %}
+                <div class="finding-card">
+                    <!-- Header Bar per Finding -->
+                    <div class="finding-header">
+                        <h3 class="finding-title">{{ vuln.title }}</h3>
+                        <div class="finding-meta">
+                            <span class="severity-tag severity-{{ vuln.severity|lower }}">{{ vuln.severity }}</span>
+                            <span class="finding-target">{{ host_ip }}:{{ vuln.port|default('N/A') }}/{{ vuln.protocol|default('TCP')|upper }}</span>
+                        </div>
+                    </div>
+                    <div class="finding-body">
+                        <!-- Finding Detail Grid -->
+                        <div class="finding-details">
+                            <div class="detail-column left">
+                                <h4>Vulnerability Overview</h4>
+                                <p>{{ vuln.description }}</p>
+                                <h4>Impact</h4>
+                                <p>This vulnerability could allow an attacker to compromise the confidentiality, integrity, or availability of the affected system.</p>
+                            </div>
+                            <div class="detail-column right">
+                                <h4>Technical Remediation</h4>
+                                <p>{{ vuln.remediation }}</p>
+                                <h4>Actionable Steps</h4>
+                                <ol class="action-steps">
+                                    <li>Validate the finding through verification testing</li>
+                                    <li>Implement the recommended remediation steps</li>
+                                    <li>Perform rescan to confirm vulnerability resolution</li>
+                                    <li>Document resolution and update asset inventory</li>
+                                    <li>Schedule follow-up assessment within 90 days</li>
+                                </ol>
+                            </div>
+                        </div>
+                        <!-- Remediation Callout -->
+                        <div class="remediation-callout">
+                            <div class="callout-title">Remediation Priority & SLA</div>
+                            <div class="callout-text">
+                                {% if vuln.severity == 'Critical' %}
+                                <strong>Immediate Action Required (24-hour SLA)</strong>: Critical vulnerability requiring emergency patching or mitigation within 24 hours to prevent potential breach.
+                                {% elif vuln.severity == 'High' %}
+                                <strong>High Priority (72-hour SLA)</strong>: Significant risk requiring resolution within 3 business days to maintain security posture.
+                                {% elif vuln.severity == 'Medium' %}
+                                <strong>Medium Priority (30-day SLA)</strong>: Moderate risk requiring resolution within standard patch cycle (30 days).
+                                {% else %}
+                                <strong>Low Priority (90-day SLA)</strong>: Low risk requiring resolution during next maintenance window or quarterly review.
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+                {% endfor %}
+            </div>
+        </section>
+        {% else %}
+        <section class="vulnerability-details">
+            <h2 class="section-title">No Vulnerabilities Found</h2>
+            <div class="no-vulns-container">
+                <div class="no-vulns-icon">✓</div>
+                <p class="no-vulns-title">Excellent Security Posture</p>
+                <p class="no-vulns-text">No security vulnerabilities were detected during this assessment. Your current security controls appear to be effective. Continue regular monitoring and scheduled assessments to maintain this strong security posture.</p>
+            </div>
+        </section>
+        {% endif %}
+
+        <!-- Active Traffic & Socket Mapping -->
+        <section class="traffic-details">
+            <h2 class="section-title">Active Traffic & Socket Mapping</h2>
+            {% if active_connections and active_connections|length > 0 %}
+            <div class="traffic-container">
+                <table class="traffic-table">
+                    <thead>
+                        <tr>
+                            <th>Local Address</th>
+                            <th>Remote Address</th>
+                            <th>Classification</th>
+                            <th>Process ID</th>
+                            <th>Process Name</th>
+                            <th>Status</th>
+                            <th>Timestamp</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for conn in active_connections %}
+                        <tr>
+                            <td>{{ conn.local_address }}</td>
+                            <td>{{ conn.remote_address }}</td>
+                            <td>
+                                <span class="classification-{{ conn.remote_classification|lower }}">
+                                    {{ conn.remote_classification }}
+                                </span>
+                            </td>
+                            <td>{{ conn.pid or 'N/A' }}</td>
+                            <td>{{ conn.process_name or 'Unknown' }}</td>
+                            <td>{{ conn.status }}</td>
+                            <td>{{ conn.timestamp }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="no-traffic-container">
+                <div class="no-traffic-icon">⚠️</div>
+                <p class="no-traffic-title">Connection Mapping Unavailable</p>
+                <p class="no-traffic-text">
+                    {% if connection_status == 'permission_denied' %}
+                        Insufficient system privileges. Run scanner as Administrator/root to capture live process socket data.
+                    {% elif connection_status == 'failed' %}
+                        Authenticated connection mapping skipped: Remote management (WinRM/SSH) unreachable or unauthorized.
+                    {% elif connection_status == 'no_data' or connection_status == 'success' %}
+                        No active connections detected.
+                    {% else %}
+                        An error occurred while attempting to collect active connections.
+                    {% endif %}
+                </p>
+            </div>
+            {% endif %}
+        </section>
+
+        <!-- Footer -->
+        <footer class="report-footer">
+            <div class="footer-content">
+                <span class="footer-left">CONFIDENTIAL - SECAPPLIANCE SECURITY ASSESSMENT</span>
+                <span class="footer-center">Page <span class="page-number"></span> of <span class="total-pages"></span></span>
+                <span class="footer-right">Scan ID: {{ scan_id }} | Generated: {{ report_generated_date }}</span>
+            </div>
+        </footer>
+    </div>
+</body>
+</html>
