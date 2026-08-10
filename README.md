@@ -44,7 +44,7 @@ pip install -r requirements.txt
 ### Syntax Overview
 
 ```bash
-python main.py scan [FLAGS]
+python main.py [OPTIONS]
 
 ```
 
@@ -52,14 +52,17 @@ python main.py scan [FLAGS]
 
 | Flag / Option | Short | Type | Description | Default |
 | --- | --- | --- | --- | --- |
-| `--target` | `-t` | String | Target IP address, hostname, IP range (e.g., `10.30.10.1-10.30.10.50`), or CIDR subnet (e.g., `10.30.10.0/24`). **[Required]** | *None* |
-| `--ports` | `-p` | String | Port ranges or specific ports to scan (e.g., `80,445,3389` or `1-1024`). | `1-1024` |
-| `--username` | `-u` | String | *(Optional)* Remote authentication username for WinRM/SSH credentialed inspection. | *None* |
-| `--password` | `-P` | String | *(Optional)* Remote authentication password or secret for WinRM/SSH. | *None* |
+| `--target` | `-t` | String | Target IP address or CIDR range (e.g., `'192.168.1.0/24'` or `'10.0.0.1'`). **[Required]** | *None* |
+| `--ports` | `-p` | String | Port range to scan (e.g., `'1-65535'`, `'1-1024'`, or `'80,443,8080'`). | `1-1024` |
+| `--web-ports` | `-w` | String | Comma-separated list of web ports to scan. | `80,443,8080,8443` |
+| `--username` | `-u` | String | Remote SSH/WinRM username for deep credentialed audits. | *None* |
+| `--password` | `-P` | String | Remote password for SSH/WinRM authentication. | *None* |
 | `--auth-type` | `-a` | String | Authentication protocol to use for deep collection (`winrm` or `ssh`). | `winrm` |
-| `--output-dir` | `-o` | String | Output directory path for saving generated reports. | `reports/` |
-| `--verbose` | `-v` | Flag | Enables detailed execution logs and debugging output on stdout. | `False` |
-| `--help` | `-h` | Flag | Displays command-line help message and available flags. | *None* |
+| `--output-dir` | `-o` | Path | Output directory path for saving generated reports. | `reports` |
+| `--verbose` | `-v` | Flag | Enable detailed debug logging and real-time execution tracing. | `False` |
+| `--install-completion` | - | - | Install completion for the current shell. | - |
+| `--show-completion` | - | - | Show completion for the current shell to copy or customize. | - |
+| `--help` | - | - | Show the command-line help message and exit. | - |
 
 ---
 
@@ -67,37 +70,28 @@ python main.py scan [FLAGS]
 
 ### 1. Fast Unauthenticated Subnet Scan (Default Mode)
 
-Scans an entire `/24` subnet for open ports and banners without needing credentials, performing CVE mapping and generating an HTML executive report.
+Scans an entire `/24` subnet across default ports without credentials, performs CVE mapping, and generates an HTML executive report.
 
 ```bash
-python main.py scan -t 10.30.10.0/24 --ports 80,445,3389,5985 -v
+python main.py -t 192.168.1.0/24 -p 1-1024 -v
 
 ```
 
-### 2. Specific Target Port Range Scan
+### 2. Custom Port Range and Output Directory
 
-Scans a specific single target across ports `1` through `1000`:
+Scans a specific target on custom web/standard ports and saves results in a designated report folder:
 
 ```bash
-python main.py scan -t ip_address -p 1-1000
+python main.py -t 10.0.0.1 -p 1-65535 -w 80,443,8080,8443,3000 -o custom_reports/
 
 ```
 
 ### 3. Credentialed Deep Audit (WinRM / Windows Remote Inspection)
 
-When credentials are provided, **SecAppliance** verifies if WinRM ports (5985/5986) are open, connects remotely to inspect active TCP connections, maps processes to PIDs via PowerShell JSON payloads, and merges internal system telemetry into the final report.
+Performs an authenticated deep inspection over WinRM, merging internal system telemetry into the assessment:
 
 ```bash
-python main.py scan -t ip_address -u "admin_user" -P "Password" --auth-type winrm
-
-```
-
-### 4. Custom Output Directory
-
-Saves the generated assessment report into a custom folder:
-
-```bash
-python main.py scan -t 10.30.10.0/24 -o my_custom_reports/
+python main.py -t 192.168.1.50 -u "Administrator" -P "YourSecurePassword" --auth-type winrm -v
 
 ```
 
@@ -133,4 +127,4 @@ This software is designed for legitimate security auditing, network maintenance,
 
 ## License
 
-This project is open-source and provided under the MIT License (Free of any commercial license restrictions or activation keys).
+This project is open-source and provided under the MIT License.
