@@ -108,243 +108,75 @@ class WebScanner:
 
     async def check_ssl(self, host: str, port: int) -> List[Dict[str, str]]:
         """
-        Check SSL/TLS certificate validity and configuration with specific error details.
-
-        Args:
-            host: Target hostname or IP.
-            port: Target port (should be 443 or 8443 for HTTPS).
-
-        Returns:
-            List of SSL/TLS issues found with specific details.
+        Check SSL/TLS certificate validity and configuration using signatures.json.
         """
         findings = []
         try:
-            # Create an SSL context that doesn't verify certificates (we want to inspect the cert)
             context = ssl.create_default_context()
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
 
-            # Establish a connection and get the peer certificate
-            reader, writer = await asyncio.wait_for(
+            _, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port, ssl=context), timeout=self.timeout.total
             )
-            # Get the peer certificate
             ssl_obj = writer.get_extra_info('sslobject')
             if ssl_obj:
                 cert = ssl_obj.getpeercert()
-                # Check expiration
-                not_after = cert.get('notAfter')
-                if not_after:
-                    # Parse the date (format: 'Jan  1 12:00:00 2025 GMT' or 'Jan 1 12:00:00 2025 GMT')
-                    try:
-                        # Try to parse with potential double space first
+                if cert:
+                    # Check expiration
+                    not_after = cert.get('notAfter')
+                    if not_after:
                         try:
-                            expiry_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
+                            # Parse expiration date
+                            try:
+                                expiry_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
+                            except ValueError:
+                                expiry_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z'.replace('  ', ' '))
+                            
+                            now = datetime.utcnow()
+                            if expiry_date < now:
+                                days_expired = (now - expiry_date).days
+                                self._add_ssl_finding(findings, host, port, "expired_certificate", {"days": days_expired})
                         except ValueError:
-                            # Try with single space if double space fails
-                            expiry_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z'.replace('  ', ' '))
-                        now = datetime.utcnow()
-                        if expiry_date < now:
-                            days_expired = (now - expiry_date).days
-                            dedup_key = (host, port, f"expired_cert_{days_expired}")
-                            if dedup_key not in self.processed_vulns:
-                                self.processed_vulns.add(dedup_key)
-                                findings.append({
-                                    "type": "ssl_error",
-                                    "detail": f"SSL certificate expired {days_expired} days ago",
-                                    "severity": "High",
-                                    "description": f"SSL certificate has been expired for {days_expired} days.",
-                                    "remediation": "Renew the SSL certificate immediately.",
-                                    "host": f"{host}:{port}",
-                                    "port": port,
-                                    "protocol": "https"
-                                })
-                    except ValueError:
-                        # If we can't parse the date, skip this check
-                        pass
+                            pass
 
-                    # Check if it's self-signed (simplified check)
+                    # Self-signed check
                     issuer = dict(x[0] for x in cert.get('issuer', []))
                     subject = dict(x[0] for x in cert.get('subject', []))
-                    # Self-signed if issuer and subject are the same
                     if issuer == subject:
-                        dedup_key = (host, port, "self_signed_cert")
-                        if dedup_key not in self.processed_vulns:
-                            self.processed_vulns.add(dedup_key)
-                            findings.append({
-                                "type": "ssl_error",
-                                "detail": "Self-signed SSL certificate",
-                                "severity": "Medium",
-                                "description": "The SSL certificate is self-signed, which is not trusted by browsers.",
-                                "remediation": "Replace the self-signed certificate with one from a trusted Certificate Authority.",
-                                "host": f"{host}:{port}",
-                                "port": port,
-                                "protocol": "https"
-                            })
-            else:
-                logger.debug(f"No SSL object found for {host}:{port}")
+                        self._add_ssl_finding(findings, host, port, "self_signed_certificate")
 
             writer.close()
             await writer.wait_closed()
-        except ssl.SSLError as e:
-            # Handle specific SSL errors
-            error_msg = str(e).lower()
-            if "certificate verify failed" in error_msg:
-                dedup_key = (host, port, "cert_verification_failed")
-                if dedup_key not in self.processed_vulns:
-                    self.processed_vulns.add(dedup_key)
-                    findings.append({
-                        "type": "ssl_error",
-                        "detail": "SSL certificate verification failed",
-                        "severity": "Medium",
-                        "description": "SSL certificate verification failed - possibly untrusted or expired certificate.",
-                        "remediation": "Check the SSL certificate validity and ensure it's issued by a trusted CA.",
-                        "host": f"{host}:{port}",
-                        "port": port,
-                        "protocol": "https"
-                    })
-            elif "tlsv1 alert unknown ca" in error_msg or "unknown ca" in error_msg:
-                dedup_key = (host, port, "unknown_ca")
-                if dedup_key not in self.processed_vulns:
-                    self.processed_vulns.add(dedup_key)
-                    findings.append({
-                        "type": "ssl_error",
-                        "detail": "Unknown Certificate Authority",
-                        "severity": "Medium",
-                        "description": "The SSL certificate is issued by an unknown or untrusted Certificate Authority.",
-                        "remediation": "Install the proper intermediate certificates or use a certificate from a trusted CA.",
-                        "host": f"{host}:{port}",
-                        "port": port,
-                        "protocol": "https"
-                    })
-            elif "certificate has expired" in error_msg:
-                dedup_key = (host, port, "expired_cert")
-                if dedup_key not in self.processed_vulns:
-                    self.processed_vulns.add(dedup_key)
-                    findings.append({
-                        "type": "ssl_error",
-                        "detail": "SSL certificate has expired",
-                        "severity": "High",
-                        "description": "The SSL certificate has expired and is no longer valid.",
-                        "remediation": "Renew the SSL certificate immediately.",
-                        "host": f"{host}:{port}",
-                        "port": port,
-                        "protocol": "https"
-                    })
-            elif "handshake failure" in error_msg:
-                dedup_key = (host, port, "handshake_failure")
-                if dedup_key not in self.processed_vulns:
-                    self.processed_vulns.add(dedup_key)
-                    findings.append({
-                        "type": "ssl_error",
-                        "detail": "SSL handshake failure",
-                        "severity": "Medium",
-                        "description": "SSL/TLS handshake failed - possibly due to protocol version or cipher suite mismatch.",
-                        "remediation": "Ensure the server supports modern TLS versions and secure cipher suites.",
-                        "host": f"{host}:{port}",
-                        "port": port,
-                        "protocol": "https"
-                    })
-            elif "decrypt error" in error_msg or "decryption failed" in error_msg:
-                dedup_key = (host, port, "decrypt_error")
-                if dedup_key not in self.processed_vulns:
-                    self.processed_vulns.add(dedup_key)
-                    findings.append({
-                        "type": "ssl_error",
-                        "detail": "SSL decryption error",
-                        "severity": "Medium",
-                        "description": "SSL/TLS decryption failed - possibly due to invalid encryption or corrupted data.",
-                        "remediation": "Check the server's SSL/TLS configuration and encryption settings.",
-                        "host": f"{host}:{port}",
-                        "port": port,
-                        "protocol": "https"
-                    })
-            elif "record too large" in error_msg:
-                dedup_key = (host, port, "record_too_large")
-                if dedup_key not in self.processed_vulns:
-                    self.processed_vulns.add(dedup_key)
-                    findings.append({
-                        "type": "ssl_error",
-                        "detail": "SSL record too large",
-                        "severity": "Low",
-                        "description": "Received an SSL/TLS record that was too large to process.",
-                        "remediation": "Check for malfunctioning SSL/TLS implementation or network issues.",
-                        "host": f"{host}:{port}",
-                        "port": port,
-                        "protocol": "https"
-                    })
-            else:
-                # Generic SSL error
-                dedup_key = (host, port, f"ssl_error_{hash(str(e))}")
-                if dedup_key not in self.processed_vulns:
-                    self.processed_vulns.add(dedup_key)
-                    findings.append({
-                        "type": "ssl_error",
-                        "detail": f"SSL error: {str(e)}",
-                        "severity": "Medium",
-                        "description": "SSL/TLS connection failed or certificate is invalid.",
-                        "remediation": "Ensure a valid SSL certificate is installed and the service is correctly configured.",
-                        "host": f"{host}:{port}",
-                        "port": port,
-                        "protocol": "https"
-                    })
         except Exception as e:
-            # If we can't connect via SSL, that's a finding too
-            error_msg = str(e).lower()
-            # Ignore connection refused, timeout, and network unreachable errors as they are not SSL vulnerabilities
-            if ("connection refused" in error_msg or "refused" in error_msg or
-                "connection timed out" in error_msg or "timed out" in error_msg or
-                "no route to host" in error_msg or "network is unreachable" in error_msg):
-                # Don't report connection issues as SSL vulnerabilities
-                pass
-            elif "no route to host" in error_msg:
-                # Don't report network unreachable as SSL vulnerabilities
-                pass
-            else:
-                # Other connection issues might indicate SSL/TLS problems
-                dedup_key = (host, port, f"ssl_conn_error_{hash(str(e))}")
-                if dedup_key not in self.processed_vulns:
-                    self.processed_vulns.add(dedup_key)
-                    # Provide more specific messaging based on error type
-                    if "connection reset" in error_msg or "connection reset by peer" in error_msg:
-                        details = "Connection reset by peer during SSL/TLS handshake"
-                        description = "The connection was reset during SSL/TLS handshake, possibly indicating SSL/TLS protocol issues."
-                        remediation = "Check SSL/TLS configuration and ensure compatible protocols/ciphers are configured."
-                        severity = "Medium"
-                    elif "connection aborted" in error_msg:
-                        details = "Connection aborted during SSL/TLS handshake"
-                        description = "The connection was aborted during SSL/TLS handshake."
-                        remediation = "Check server SSL/TLS configuration and connectivity."
-                        severity = "Medium"
-                    elif "broken pipe" in error_msg or "broken pipe" in error_msg:
-                        details = "Broken pipe during SSL/TLS handshake"
-                        description = "Broken pipe encountered during SSL/TLS handshake."
-                        remediation = "The connection was terminated unexpectedly. Check if the service is properly configured for SSL/TLS."
-                        severity = "Medium"
-                    elif "timeout" in error_msg:
-                        details = "SSL/TLS handshake timeout"
-                        description = "SSL/TLS handshake timed out."
-                        remediation = "Check server responsiveness and SSL/TLS configuration."
-                        severity = "Low"
-                    else:
-                        details = f"SSL connection error: {str(e)}"
-                        description = "SSL/TLS connection failed or certificate is invalid."
-                        remediation = "Ensure a valid SSL certificate is installed and the service is correctly configured."
-                        severity = "Medium"
-
-                    findings.append({
-                        "type": "ssl_error",
-                        "detail": details,
-                        "severity": severity,
-                        "description": description,
-                        "remediation": remediation,
-                        "host": f"{host}:{port}",
-                        "port": port,
-                        "protocol": "https"
-                    })
             logger.debug(f"SSL check failed for {host}:{port}: {e}")
-
         return findings
+
+    def _add_ssl_finding(self, findings: List, host: str, port: int, error_type: str, extra: Dict = None):
+        """Helper to add SSL finding from signatures."""
+        dedup_key = (host, port, error_type)
+        if dedup_key in self.processed_vulns:
+            return
+        
+        sig = next((s for s in self.signatures.get("ssl_errors", []) if s["type"] == error_type), None)
+        if not sig:
+            return
+
+        self.processed_vulns.add(dedup_key)
+        description = sig["description"]
+        if error_type == "expired_certificate" and extra:
+            description = f"{description} (Expired {extra['days']} days ago)"
+            
+        findings.append({
+            "type": "ssl_error",
+            "detail": sig["title"],
+            "severity": sig["severity"],
+            "description": description,
+            "remediation": sig["remediation"],
+            "host": f"{host}:{port}",
+            "port": port,
+            "protocol": "https"
+        })
 
     async def scan_host(self, host: str, ports: List[int], scan_id: int) -> None:
         """
