@@ -4,15 +4,21 @@ import ssl
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple
-import socket
 from datetime import datetime
 
 from utils.logger import logger
 from core.database import DatabaseManager
 
 
+def _resolve_path(path: str) -> Path:
+    """Resolve a config path, honoring relative paths from the project root."""
+    if Path(path).is_absolute():
+        return Path(path)
+    return Path(__file__).parent.parent / path
+
+
 class WebScanner:
-    def __init__(self, db_manager: DatabaseManager, signatures_path: str = "config/signatures.json", timeout: int = 10):
+    def __init__(self, db_manager: DatabaseManager, signatures_path: str = "config/signatures.json", timeout: int = 10, accept_invalid_certs: bool = False):
         """
         Initialize the web scanner.
 
@@ -20,10 +26,13 @@ class WebScanner:
             db_manager: Instance of DatabaseManager for storing vulnerabilities.
             signatures_path: Path to the JSON file containing security signatures.
             timeout: Timeout in seconds for HTTP requests.
+            accept_invalid_certs: When True, skip TLS certificate validation when
+                fetching headers. When False (default), certificates are verified.
         """
         self.db = db_manager
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.signatures = self._load_signatures(signatures_path)
+        self.accept_invalid_certs = accept_invalid_certs
         self.session: Optional[aiohttp.ClientSession] = None
         # Track processed vulnerabilities to avoid duplicates
         self.processed_vulns: Set[Tuple[str, int, str]] = set()
@@ -39,14 +48,14 @@ class WebScanner:
             Dictionary containing signature definitions.
         """
         try:
-            with open(signatures_path, 'r') as f:
+            with open(_resolve_path(signatures_path), 'r') as f:
                 return json.load(f)
         except FileNotFoundError:
             logger.warning(f"Signature file not found at {signatures_path}. Using empty signatures.")
-            return {"headers": [], "ports": []}
+            return {"headers": [], "ports": [], "ssl_errors": []}
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse signature file: {e}")
-            return {"headers": [], "ports": []}
+            return {"headers": [], "ports": [], "ssl_errors": []}
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -57,6 +66,14 @@ class WebScanner:
         """Async context manager exit."""
         if self.session:
             await self.session.close()
+
+    def _get_ssl_context(self, verify: bool) -> ssl.SSLContext:
+        """Build an SSL context, optionally with verification disabled."""
+        context = ssl.create_default_context()
+        if not verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        return context
 
     async def check_headers(self, host: str, port: int, is_https: bool) -> List[Dict[str, str]]:
         """
@@ -77,28 +94,41 @@ class WebScanner:
         url = f"{scheme}://{host}:{port}"
         findings = []
 
-        try:
-            async with self.session.get(url, ssl=False, allow_redirects=True) as response:
-                headers = response.headers
+        ssl_context = None
+        if is_https:
+            ssl_context = self._get_ssl_context(verify=not self.accept_invalid_certs)
 
-                # Check each security header from signatures
-                for header_info in self.signatures.get("headers", []):
-                    header_name = header_info["name"]
-                    if header_name not in headers:
-                        # Create a unique key for deduplication
-                        dedup_key = (host, port, f"missing_header_{header_name}")
-                        if dedup_key not in self.processed_vulns:
-                            self.processed_vulns.add(dedup_key)
-                            findings.append({
-                                "type": "missing_header",
-                                "header": header_name,
-                                "port": port,
-                                "protocol": "https" if is_https else "http",
-                                "severity": header_info["severity"],
-                                "description": header_info["description"],
-                                "remediation": header_info["remediation"],
-                                "url": url
-                            })
+        try:
+            try:
+                async with self.session.get(url, ssl=ssl_context, allow_redirects=True) as response:
+                    headers = response.headers
+            except ssl.SSLCertVerificationError as cert_err:
+                # Certificate validation failed. Retry without verification so we can
+                # still report the security headers; the certificate issue itself is
+                # reported separately by check_ssl.
+                logger.warning(f"Certificate verification failed for {url} ({cert_err}). Retrying without verification.")
+                insecure_context = self._get_ssl_context(verify=False)
+                async with self.session.get(url, ssl=insecure_context, allow_redirects=True) as response:
+                    headers = response.headers
+
+            # Check each security header from signatures
+            for header_info in self.signatures.get("headers", []):
+                header_name = header_info["name"]
+                if header_name not in headers:
+                    # Create a unique key for deduplication
+                    dedup_key = (host, port, f"missing_header_{header_name}")
+                    if dedup_key not in self.processed_vulns:
+                        self.processed_vulns.add(dedup_key)
+                        findings.append({
+                            "type": "missing_header",
+                            "header": header_name,
+                            "port": port,
+                            "protocol": "https" if is_https else "http",
+                            "severity": header_info["severity"],
+                            "description": header_info["description"],
+                            "remediation": header_info["remediation"],
+                            "url": url
+                        })
         except asyncio.TimeoutError:
             logger.warning(f"Timeout while checking headers for {url}")
         except Exception as e:
@@ -106,16 +136,51 @@ class WebScanner:
 
         return findings
 
+    @staticmethod
+    def _classify_cert_error(error: ssl.SSLCertVerificationError) -> Optional[str]:
+        """Map an SSL certificate verification error to a signature error type."""
+        message = str(error).lower()
+        if "has expired" in message or "expired" in message:
+            return "expired_certificate"
+        if "self-signed" in message:
+            return "self_signed_certificate"
+        if "mismatch" in message:
+            return "hostname_mismatch"
+        if "unable to get local issuer" in message or "unable to get issuer" in message or "not trusted" in message:
+            return "untrusted_issuer"
+        return None
+
     async def check_ssl(self, host: str, port: int) -> List[Dict[str, str]]:
         """
         Check SSL/TLS certificate validity and configuration using signatures.json.
         """
         findings = []
-        try:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
 
+        # First attempt a verified connection to surface certificate errors.
+        verify_context = ssl.create_default_context()
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=verify_context), timeout=self.timeout.total
+            )
+            writer.close()
+            await writer.wait_closed()
+            verified = True
+        except ssl.SSLCertVerificationError as e:
+            verified = False
+            error_type = self._classify_cert_error(e)
+            if error_type:
+                self._add_ssl_finding(findings, host, port, error_type)
+        except Exception:
+            # Non-certificate failures (e.g. refused, timeout) are handled below.
+            verified = True
+
+        # Grab certificate details with an unverified probe so expiration and
+        # self-signed status can be reported even when validation fails.
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        try:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port, ssl=context), timeout=self.timeout.total
             )
@@ -127,12 +192,7 @@ class WebScanner:
                     not_after = cert.get('notAfter')
                     if not_after:
                         try:
-                            # Parse expiration date
-                            try:
-                                expiry_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
-                            except ValueError:
-                                expiry_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z'.replace('  ', ' '))
-                            
+                            expiry_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
                             now = datetime.utcnow()
                             if expiry_date < now:
                                 days_expired = (now - expiry_date).days
@@ -150,6 +210,10 @@ class WebScanner:
             await writer.wait_closed()
         except Exception as e:
             logger.debug(f"SSL check failed for {host}:{port}: {e}")
+
+        if not verified:
+            logger.warning(f"TLS certificate validation failed for {host}:{port}")
+
         return findings
 
     def _add_ssl_finding(self, findings: List, host: str, port: int, error_type: str, extra: Dict = None):
@@ -157,7 +221,7 @@ class WebScanner:
         dedup_key = (host, port, error_type)
         if dedup_key in self.processed_vulns:
             return
-        
+
         sig = next((s for s in self.signatures.get("ssl_errors", []) if s["type"] == error_type), None)
         if not sig:
             return
@@ -166,7 +230,7 @@ class WebScanner:
         description = sig["description"]
         if error_type == "expired_certificate" and extra:
             description = f"{description} (Expired {extra['days']} days ago)"
-            
+
         findings.append({
             "type": "ssl_error",
             "detail": sig["title"],

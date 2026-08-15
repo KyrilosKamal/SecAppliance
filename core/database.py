@@ -1,9 +1,7 @@
 import aiosqlite
-import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-import json
 
 from utils.logger import logger
 

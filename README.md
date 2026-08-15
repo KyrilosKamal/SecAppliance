@@ -37,10 +37,21 @@ python main.py [OPTIONS]
 | `--ports`, `-p` | str | Port range to scan | 1-1024 |
 | `--web-ports`, `-w` | str | Comma-separated list of web ports to scan | 80,443,8080,8443 |
 | `--username`, `-u` | str | Remote SSH/WinRM username | None |
-| `--password`, `-P` | str | Remote password | None |
+| `--password`, `-P` | str | Remote password (visible in process list; prefer `SECAPPLIANCE_PASSWORD`) | None |
 | `--auth-type`, `-a` | str | Auth protocol ('winrm' or 'ssh') | winrm |
 | `--output-dir`, `-o` | path | Output directory for reports | reports |
 | `--verbose`, `-v` | bool | Enable detailed debug logging | False |
+| `--accept-unknown-hosts` | bool | Automatically accept unknown SSH host keys (insecure) | False |
+| `--accept-invalid-certs` | bool | Skip TLS certificate validation for WinRM and web checks (insecure) | False |
+
+> **Password handling**: Passwords are verified against the `SECAPPLIANCE_PASSWORD`
+> environment variable and an interactive prompt as fallback. Avoid passing them
+> via `--password`, which exposes them in the process list and shell history.
+>
+> **Transport security**: SSH host keys are verified against `known_hosts` and
+> WinRM/web TLS certificates are validated by default. Use the
+> `--accept-unknown-hosts` / `--accept-invalid-certs` flags only against
+> targets you control.
 
 ### Usage Examples
 1. **Fast unauthenticated subnet scan**:
@@ -51,9 +62,10 @@ python main.py [OPTIONS]
    ```bash
    python main.py -t 10.0.0.1 -p 1-65535 -o ./my_reports
    ```
-3. **Credentialed WinRM deep audit**:
+3. **Credentialed WinRM deep audit (secure password handling)**:
    ```bash
-   python main.py -t 10.0.0.5 -u admin -P secret123 -a winrm
+   export SECAPPLIANCE_PASSWORD='secret123'
+   python main.py -t 10.0.0.5 -u admin -a winrm
    ```
 
 ## Project Architecture

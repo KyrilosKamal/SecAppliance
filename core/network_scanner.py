@@ -3,26 +3,40 @@ import asyncio
 import ipaddress
 import socket
 import psutil
-from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-import logging
 
 from utils.logger import logger
 from utils.net_utils import map_tcp_state, classify_ip
 from core.database import DatabaseManager
 
 
+def is_local(target: str) -> bool:
+    """Return True if the target refers to the local host."""
+    return target in ["127.0.0.1", "localhost", "::1"] or target == socket.gethostname()
+
+
 class NetworkScanner:
-    def __init__(self, db_manager: DatabaseManager, max_concurrent: int = 200, timeout: float = 3.0, verbose: bool = False):
+    def __init__(self, db_manager: DatabaseManager, max_concurrent: int = 200, timeout: float = 3.0, verbose: bool = False,
+                 accept_unknown_hosts: bool = False, accept_invalid_certs: bool = False):
         """
         Initialize the network scanner.
+
+        Args:
+            db_manager: DatabaseManager instance.
+            max_concurrent: Maximum number of concurrent port scans.
+            timeout: Connection timeout in seconds.
+            verbose: Enable debug logging.
+            accept_unknown_hosts: Passed to RemoteCollector (SSH host key verification).
+            accept_invalid_certs: Passed to RemoteCollector (WinRM cert validation).
         """
         self.db = db_manager
         self.max_concurrent = max_concurrent
         self.timeout = timeout
         self.verbose = verbose
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.accept_unknown_hosts = accept_unknown_hosts
+        self.accept_invalid_certs = accept_invalid_certs
 
         # Common ports to scan with associated service names for banner grabbing hints
         self.common_ports = {
@@ -135,7 +149,9 @@ class NetworkScanner:
     def get_active_connections(self, scan_id: int = None) -> List[Dict[str, Any]]:
         """
         Get active network connections on the local host.
-        Fallback: If no active sockets are found, maps all open ports detected in the scan.
+
+        Args:
+            scan_id: Unused; kept for interface compatibility.
 
         Returns:
             List of dictionaries containing connection information.
@@ -146,9 +162,6 @@ class NetworkScanner:
             net_connections = psutil.net_connections(kind='inet')
 
             for conn in net_connections:
-                # Removed: Only consider established TCP connections
-                # if conn.status == 'ESTABLISHED' and conn.type == socket.SOCK_STREAM:
-                
                 local_addr = f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else "N/A"
                 remote_addr = f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "N/A"
 
@@ -178,15 +191,6 @@ class NetworkScanner:
         except Exception as e:
             logger.error(f"Error getting active connections: {e}")
 
-        # Fallback Logic: If no active sockets, map open ports
-        if not connections and scan_id:
-            logger.info("No active sockets detected, falling back to open port mapping.")
-            # We would need access to the db to get open ports here, 
-            # or handle this mapping after scanning finishes.
-            # Simplified approach: return an empty list and rely on the database layer 
-            # to handle the fallback if 'status' is 'success' but connections list is empty
-            pass
-
         return connections
 
     async def collect_and_store_active_connections(self, scan_id: int, target: str, credentials: Optional[Dict[str, str]] = None) -> None:
@@ -196,20 +200,19 @@ class NetworkScanner:
         try:
             connections = []
             status = "success"
-            
-            # Helper to check if target is local
-            def is_local(t):
-                return t in ["127.0.0.1", "localhost", "::1"] or t == socket.gethostname()
 
             if credentials:
                 # Attempt remote collection
                 try:
                     from core.remote_collector import RemoteCollector
-                    collector = RemoteCollector()
+                    collector = RemoteCollector(
+                        accept_unknown_hosts=self.accept_unknown_hosts,
+                        accept_invalid_certs=self.accept_invalid_certs
+                    )
                     connections = collector.collect_connections(
-                        target, 
-                        credentials["username"], 
-                        credentials["password"], 
+                        target,
+                        credentials["username"],
+                        credentials["password"],
                         credentials["auth_type"]
                     )
                     if not connections:
@@ -232,7 +235,7 @@ class NetworkScanner:
                     connections = self.get_active_connections(scan_id)
                 else:
                     status = "skipped"
-            
+
             # Dynamic Open Port Fallback mapping if no active connections were found
             if not connections:
                 logger.info(f"No active network connections captured. Initiating dynamic fallback mapping for open ports.")
@@ -255,6 +258,7 @@ class NetworkScanner:
         except Exception as e:
             logger.error(f"Failed to collect and store active connections for scan {scan_id}: {e}")
             raise
+
     async def scan_host(self, ip: str, scan_id: int, ports: List[int] = None) -> None:
         """
         Scan a single host for open ports and common services, and store results in the database.
@@ -268,18 +272,14 @@ class NetworkScanner:
             ports = list(self.common_ports.keys())
 
         logger.info(f"Scanning host: {ip} on {len(ports)} ports")
-        tasks = []
-        for port in ports:
-            task = asyncio.create_task(self.scan_port(ip, port))
-            tasks.append(task)
 
         # Wait for all port scan tasks to complete
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(
+                *(self.scan_port(ip, port) for port in ports),
+                return_exceptions=True
+            )
         except KeyboardInterrupt:
-            # Cancel all tasks
-            for task in tasks:
-                task.cancel()
             raise
 
         # Process results
@@ -296,9 +296,11 @@ class NetworkScanner:
         # If we found any open ports, consider the host alive
         is_alive = len(open_ports) > 0
 
-        # Try to get hostname via reverse DNS (optional, can be slow)
+        # Try to get hostname via reverse DNS (optional, can be slow).
+        # Run in a thread to avoid blocking the event loop.
         try:
-            hostname = socket.gethostbyaddr(ip)[0]
+            hostname = await asyncio.to_thread(socket.gethostbyaddr, ip)
+            hostname = hostname[0]
             # If the hostname is "Anonymous", treat it as failure and fall back to IP
             if hostname == "Anonymous":
                 raise socket.herror
@@ -312,7 +314,6 @@ class NetworkScanner:
 
             # Store each open port
             for port, protocol, banner, service_info in open_ports:
-                import json  # Ensure json is available in this scope for PyInstaller
                 await self.db.add_port(
                     host_id,
                     port,
@@ -343,17 +344,17 @@ class NetworkScanner:
             except ValueError:
                 ips_to_scan.add(target)
 
-        # Create tasks
-        tasks = []
+        # Build work items without spawning tasks up-front so large target
+        # ranges do not exhaust memory.
+        work_items = []
         for ip in ips_to_scan:
-            tasks.append(self.scan_host(ip, scan_id, ports))
+            work_items.append((self.scan_host, (ip, scan_id, ports)))
             # Also collect connections if credentials provided OR if target is local
-            def is_local(t):
-                return t in ["127.0.0.1", "localhost", "::1"] or t == socket.gethostname()
             if credentials or is_local(ip):
-                tasks.append(self.collect_and_store_active_connections(scan_id, ip, credentials))
+                work_items.append((self.collect_and_store_active_connections, (scan_id, ip, credentials)))
 
-        # Wait for all tasks to complete concurrently with progress bar
+        # Wait for all tasks to complete concurrently with progress bar,
+        # processing in bounded batches.
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -361,14 +362,17 @@ class NetworkScanner:
             TaskProgressColumn(),
             transient=True,
         ) as progress:
-            task_id = progress.add_task(description="Scanning network...", total=len(tasks))
+            task_id = progress.add_task(description="Scanning network...", total=len(work_items))
 
-            # Using semaphore to limit concurrency
-            async def run_task(t):
-                res = await t
-                progress.update(task_id, advance=1)
-                return res
+            batch_size = max(self.max_concurrent, 1)
+            for start in range(0, len(work_items), batch_size):
+                batch = work_items[start:start + batch_size]
 
-            await asyncio.gather(*[run_task(t) for t in tasks], return_exceptions=True)
+                async def run_batch(batch):
+                    tasks = [asyncio.create_task(fn(*args)) for fn, args in batch]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                await run_batch(batch)
+                progress.update(task_id, advance=len(batch))
 
         logger.info("Network scanning and connection collection completed.")

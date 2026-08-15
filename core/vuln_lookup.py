@@ -55,15 +55,6 @@ CVE_DB = [
         "description": "Samba 4.6.4 is vulnerable to remote code execution.",
         "remediation": "Update to Samba 4.6.5 or later."
     },
-    # RDP (Generic, as RDP version is often hard to grab)
-    {
-        "pattern": "Microsoft Terminal Services",
-        "cve": "CVE-2019-0708 (BlueKeep)",
-        "severity": "CRITICAL",
-        "title": "BlueKeep RDP Vulnerability",
-        "description": "Potentially vulnerable to BlueKeep.",
-        "remediation": "Apply latest Windows security patches."
-    },
     # VNC
     {
         "pattern": "RealVNC 5.3",
@@ -75,11 +66,28 @@ CVE_DB = [
     }
 ]
 
+
+def _normalize(text: str) -> str:
+    """Normalize a string for fuzzy signature matching."""
+    return text.replace('_', ' ').replace('-', ' ').replace('/', ' ').strip()
+
+
 def get_vulns_for_service(service_name, banner):
+    """
+    Match a service name and banner against the local CVE signature database.
+
+    Patterns are matched against both the service name and the banner to reduce
+    false positives. Banner-only patterns are kept deliberately version-specific.
+    """
     findings = []
-    # Ensure banner is not None before matching
-    if banner:
-        for entry in CVE_DB:
-            if entry["pattern"] in banner:
-                findings.append(entry)
+    if not banner:
+        return findings
+
+    service_name = _normalize(service_name or "").upper()
+    banner = _normalize(banner).upper()
+
+    for entry in CVE_DB:
+        pattern = _normalize(entry["pattern"]).upper()
+        if pattern in banner or pattern in service_name:
+            findings.append(entry)
     return findings

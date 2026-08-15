@@ -1,10 +1,9 @@
-import os
+import json
 import sys
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, Any, List
 from jinja2 import Environment, FileSystemLoader
-import asyncio
-import logging
 
 from utils.logger import logger
 from core.vuln_lookup import get_vulns_for_service
@@ -18,8 +17,7 @@ def resource_path(relative_path: str = "") -> Path:
         base_path = Path(__file__).parent.parent
     return base_path / relative_path
 
-import json
-# ...
+
 class HTMLReportGenerator:
     def __init__(self, db_manager, template_dir: str = "reporting/templates", reports_dir: str = "reports"):
         """
