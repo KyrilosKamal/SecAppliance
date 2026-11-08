@@ -1,7 +1,8 @@
+import asyncio
 import aiosqlite
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 from utils.logger import logger
 
@@ -18,6 +19,10 @@ class DatabaseManager:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.connection: Optional[aiosqlite.Connection] = None
+        # Single connection => single transaction. Every write path must hold
+        # this lock across execute+commit so one task's rollback cannot discard
+        # another task's uncommitted rows.
+        self._write_lock: asyncio.Lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Establish a connection to the database."""
@@ -37,96 +42,152 @@ class DatabaseManager:
             await self.connection.close()
             logger.info("Database connection closed.")
 
+    @property
+    def write_lock(self) -> asyncio.Lock:
+        """Lock guarding the shared connection's write transaction.
+
+        Callers that must wrap a raw execute/commit block (rather than a
+        DatabaseManager method) take this lock themselves. Do not call
+        commit()/rollback() while holding it: those helpers re-acquire it.
+        """
+        return self._write_lock
+
+    async def commit(self) -> None:
+        """Commit pending work on the shared connection, under the write lock."""
+        async with self._write_lock:
+            await self.connection.commit()
+
+    async def rollback(self) -> None:
+        """Roll back pending work on the shared connection, under the write lock."""
+        async with self._write_lock:
+            await self.connection.rollback()
+
     async def initialize_tables(self) -> None:
         """Create tables if they do not exist."""
         if not self.connection:
             raise RuntimeError("Database not connected. Call connect() first.")
 
-        try:
-            # Create scans table
-            await self.connection.execute("""
-                CREATE TABLE IF NOT EXISTS scans (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    target_range TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    start_time TEXT NOT NULL,
-                    end_time TEXT
-                )
-            """)
-
-            # Create hosts table
-            await self.connection.execute("""
-                CREATE TABLE IF NOT EXISTS hosts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id INTEGER NOT NULL,
-                    ip_address TEXT NOT NULL,
-                    is_alive BOOLEAN NOT NULL,
-                    hostname TEXT,
-                    FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
-                )
-            """)
-
-            # Create ports table with enhanced columns for service information
-            await self.connection.execute("""
-                CREATE TABLE IF NOT EXISTS ports (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    host_id INTEGER NOT NULL,
-                    port_number INTEGER NOT NULL,
-                    protocol TEXT NOT NULL,
-                    service_name TEXT,
-                    banner TEXT,
-                    service_info TEXT,  -- JSON string with additional service info
-                    FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE
-                )
-            """)
-
-            # Create vulnerabilities table
-            await self.connection.execute("""
-                CREATE TABLE IF NOT EXISTS vulnerabilities (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    host_id INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    description TEXT,
-                    remediation TEXT,
-                    port INTEGER,
-                    protocol TEXT,
-                    FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE
-                )
-            """)
-
-            # Add columns if they don't exist (for migrations)
+        async with self._write_lock:
             try:
-                await self.connection.execute("ALTER TABLE vulnerabilities ADD COLUMN port INTEGER")
-            except Exception:
-                pass  # Column likely already exists
-            try:
-                await self.connection.execute("ALTER TABLE vulnerabilities ADD COLUMN protocol TEXT")
-            except Exception:
-                pass
+                # Create scans table
+                await self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS scans (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        target_range TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        start_time TEXT NOT NULL,
+                        end_time TEXT
+                    )
+                """)
 
-            # Create active_connections table for storing current network connections
-            await self.connection.execute("""
-                CREATE TABLE IF NOT EXISTS active_connections (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id INTEGER NOT NULL,
-                    local_address TEXT NOT NULL,
-                    remote_address TEXT NOT NULL,
-                    remote_classification TEXT NOT NULL,  -- LAN, WAN, etc.
-                    pid INTEGER,
-                    process_name TEXT,
-                    status TEXT,
-                    collection_status TEXT DEFAULT 'success',
-                    timestamp TEXT NOT NULL,
-                    FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
-                )
-            """)
+                # Create hosts table
+                await self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS hosts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        scan_id INTEGER NOT NULL,
+                        ip_address TEXT NOT NULL,
+                        is_alive BOOLEAN NOT NULL,
+                        hostname TEXT,
+                        FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
+                    )
+                """)
 
-            await self.connection.commit()
-            logger.info("Database tables initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize tables: {e}")
-            raise
+                # Create ports table with enhanced columns for service information
+                await self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS ports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        host_id INTEGER NOT NULL,
+                        port_number INTEGER NOT NULL,
+                        protocol TEXT NOT NULL,
+                        service_name TEXT,
+                        banner TEXT,
+                        service_info TEXT,  -- JSON string with additional service info
+                        FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE
+                    )
+                """)
+
+                # Create vulnerabilities table
+                await self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS vulnerabilities (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        host_id INTEGER NOT NULL,
+                        title TEXT NOT NULL,
+                        severity TEXT NOT NULL,
+                        description TEXT,
+                        remediation TEXT,
+                        port INTEGER,
+                        protocol TEXT,
+                        FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE
+                    )
+                """)
+
+                # Add columns if they don't exist (for migrations)
+                try:
+                    await self.connection.execute("ALTER TABLE vulnerabilities ADD COLUMN port INTEGER")
+                except Exception:
+                    pass  # Column likely already exists
+                try:
+                    await self.connection.execute("ALTER TABLE vulnerabilities ADD COLUMN protocol TEXT")
+                except Exception:
+                    pass
+
+                # Create active_connections table for storing current network connections
+                await self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS active_connections (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        scan_id INTEGER NOT NULL,
+                        local_address TEXT NOT NULL,
+                        remote_address TEXT NOT NULL,
+                        remote_classification TEXT NOT NULL,  -- LAN, WAN, etc.
+                        pid INTEGER,
+                        process_name TEXT,
+                        status TEXT,
+                        collection_status TEXT DEFAULT 'success',
+                        timestamp TEXT NOT NULL,
+                        FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
+                    )
+                """)
+
+                # Derived port data (from open-port scan results), kept separate from
+                # observed active connections so provenance is explicit in the schema.
+                await self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS derived_ports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        scan_id INTEGER NOT NULL,
+                        ip_address TEXT NOT NULL,
+                        port INTEGER NOT NULL,
+                        service_name TEXT,
+                        timestamp TEXT NOT NULL,
+                        FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
+                    )
+                """)
+
+                # Indexes for the lookup columns every report/host/port query filters
+                # on. hosts gets a composite because web_scanner looks a host up by
+                # (scan_id, ip_address); the leading scan_id column still serves the
+                # scan_id-only queries, so no separate single-column index is needed.
+                await self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_hosts_scan_ip ON hosts(scan_id, ip_address)
+                """)
+                await self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_ports_host_id ON ports(host_id)
+                """)
+                await self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_vulnerabilities_host_id ON vulnerabilities(host_id)
+                """)
+                await self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_active_connections_scan_id ON active_connections(scan_id)
+                """)
+                await self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_derived_ports_scan_id ON derived_ports(scan_id)
+                """)
+
+                await self.connection.commit()
+                logger.info("Database tables initialized successfully.")
+            except Exception as e:
+                logger.error(f"Failed to initialize tables: {e}")
+                await self.connection.rollback()
+                raise
 
     async def create_scan(self, target_range: str) -> int:
         """
@@ -141,22 +202,24 @@ class DatabaseManager:
         if not self.connection:
             raise RuntimeError("Database not connected. Call connect() first.")
 
-        try:
-            start_time = datetime.utcnow().isoformat()
-            cursor = await self.connection.execute(
-                """
-                INSERT INTO scans (target_range, status, start_time)
-                VALUES (?, ?, ?)
-                """,
-                (target_range, "running", start_time)
-            )
-            await self.connection.commit()
-            scan_id = cursor.lastrowid
-            logger.info(f"Created scan record with ID {scan_id} for target range {target_range}")
-            return scan_id
-        except Exception as e:
-            logger.error(f"Failed to create scan: {e}")
-            raise
+        async with self._write_lock:
+            try:
+                start_time = datetime.now(timezone.utc).isoformat()
+                cursor = await self.connection.execute(
+                    """
+                    INSERT INTO scans (target_range, status, start_time)
+                    VALUES (?, ?, ?)
+                    """,
+                    (target_range, "running", start_time)
+                )
+                await self.connection.commit()
+                scan_id = cursor.lastrowid
+                logger.info(f"Created scan record with ID {scan_id} for target range {target_range}")
+                return scan_id
+            except Exception as e:
+                logger.error(f"Failed to create scan: {e}")
+                await self.connection.rollback()
+                raise
 
     async def update_scan_status(self, scan_id: int, status: str, end_time: Optional[str] = None) -> None:
         """
@@ -170,22 +233,24 @@ class DatabaseManager:
         if not self.connection:
             raise RuntimeError("Database not connected. Call connect() first.")
 
-        try:
-            if end_time is None:
-                end_time = datetime.utcnow().isoformat()
-            await self.connection.execute(
-                """
-                UPDATE scans
-                SET status = ?, end_time = ?
-                WHERE id = ?
-                """,
-                (status, end_time, scan_id)
-            )
-            await self.connection.commit()
-            logger.info(f"Updated scan {scan_id} status to {status} with end time {end_time}")
-        except Exception as e:
-            logger.error(f"Failed to update scan {scan_id}: {e}")
-            raise
+        async with self._write_lock:
+            try:
+                if end_time is None:
+                    end_time = datetime.now(timezone.utc).isoformat()
+                await self.connection.execute(
+                    """
+                    UPDATE scans
+                    SET status = ?, end_time = ?
+                    WHERE id = ?
+                    """,
+                    (status, end_time, scan_id)
+                )
+                await self.connection.commit()
+                logger.info(f"Updated scan {scan_id} status to {status} with end time {end_time}")
+            except Exception as e:
+                logger.error(f"Failed to update scan {scan_id}: {e}")
+                await self.connection.rollback()
+                raise
 
     async def get_scan(self, scan_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -277,21 +342,23 @@ class DatabaseManager:
         if not self.connection:
             raise RuntimeError("Database not connected. Call connect() first.")
 
-        try:
-            cursor = await self.connection.execute(
-                """
-                INSERT INTO hosts (scan_id, ip_address, is_alive, hostname)
-                VALUES (?, ?, ?, ?)
-                """,
-                (scan_id, ip_address, is_alive, hostname)
-            )
-            await self.connection.commit()
-            host_id = cursor.lastrowid
-            logger.debug(f"Added host {ip_address} with ID {host_id}")
-            return host_id
-        except Exception as e:
-            logger.error(f"Failed to add host {ip_address}: {e}")
-            raise
+        async with self._write_lock:
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    INSERT INTO hosts (scan_id, ip_address, is_alive, hostname)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (scan_id, ip_address, is_alive, hostname)
+                )
+                await self.connection.commit()
+                host_id = cursor.lastrowid
+                logger.debug(f"Added host {ip_address} with ID {host_id}")
+                return host_id
+            except Exception as e:
+                logger.error(f"Failed to add host {ip_address}: {e}")
+                await self.connection.rollback()
+                raise
 
     async def add_port(self, host_id: int, port_number: int, protocol: str,
                        service_name: str = None, banner: str = None,
@@ -313,58 +380,128 @@ class DatabaseManager:
         if not self.connection:
             raise RuntimeError("Database not connected. Call connect() first.")
 
-        try:
-            cursor = await self.connection.execute(
-                """
-                INSERT INTO ports (host_id, port_number, protocol, service_name, banner, service_info)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (host_id, port_number, protocol, service_name, banner, service_info)
-            )
-            await self.connection.commit()
-            port_id = cursor.lastrowid
-            logger.debug(f"Added port {port_number}/{protocol} for host {host_id} with ID {port_id}")
-            return port_id
-        except Exception as e:
-            logger.error(f"Failed to add port {port_number}/{protocol} for host {host_id}: {e}")
-            raise
+        async with self._write_lock:
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    INSERT INTO ports (host_id, port_number, protocol, service_name, banner, service_info)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (host_id, port_number, protocol, service_name, banner, service_info)
+                )
+                await self.connection.commit()
+                port_id = cursor.lastrowid
+                logger.debug(f"Added port {port_number}/{protocol} for host {host_id} with ID {port_id}")
+                return port_id
+            except Exception as e:
+                logger.error(f"Failed to add port {port_number}/{protocol} for host {host_id}: {e}")
+                await self.connection.rollback()
+                raise
 
-    async def add_vulnerability(self, host_id: int, title: str, severity: str,
-                                description: str = None, remediation: str = None,
-                                port: int = None, protocol: str = None) -> int:
+    async def add_host_with_ports(self, scan_id: int, ip_address: str, is_alive: bool,
+                                  hostname: Optional[str],
+                                  ports: List[Dict[str, Any]]) -> int:
         """
-        Add a vulnerability to the database.
+        Add a host and all of its open ports in a single transaction.
+
+        Used by the network scanner so a host with many open ports costs one
+        commit instead of one per port.
 
         Args:
-            host_id: The ID of the host.
-            title: The title of the vulnerability.
-            severity: The severity level (e.g., High, Medium, Low).
-            description: Description of the vulnerability.
-            remediation: Remediation steps.
-            port: The port where the vulnerability was found.
-            protocol: The protocol (tcp/udp).
+            scan_id: The ID of the scan.
+            ip_address: The IP address of the host.
+            is_alive: Whether the host is alive.
+            hostname: The hostname of the host.
+            ports: Dictionaries with port_number, protocol, service_name,
+                banner and service_info keys.
 
         Returns:
-            The ID of the newly added vulnerability.
+            The ID of the newly added host.
         """
         if not self.connection:
             raise RuntimeError("Database not connected. Call connect() first.")
 
-        try:
-            cursor = await self.connection.execute(
-                """
-                INSERT INTO vulnerabilities (host_id, title, severity, description, remediation, port, protocol)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (host_id, title, severity, description, remediation, port, protocol)
-            )
-            await self.connection.commit()
-            vuln_id = cursor.lastrowid
-            logger.debug(f"Added vulnerability '{title}' for host {host_id} with ID {vuln_id}")
-            return vuln_id
-        except Exception as e:
-            logger.error(f"Failed to add vulnerability '{title}' for host {host_id}: {e}")
-            raise
+        async with self._write_lock:
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    INSERT INTO hosts (scan_id, ip_address, is_alive, hostname)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (scan_id, ip_address, is_alive, hostname)
+                )
+                host_id = cursor.lastrowid
+                if ports:
+                    await self.connection.executemany(
+                        """
+                        INSERT INTO ports (host_id, port_number, protocol, service_name, banner, service_info)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                host_id,
+                                row.get("port_number"),
+                                row.get("protocol"),
+                                row.get("service_name"),
+                                row.get("banner"),
+                                row.get("service_info"),
+                            )
+                            for row in ports
+                        ]
+                    )
+                await self.connection.commit()
+                logger.debug(f"Added host {ip_address} (ID {host_id}) with {len(ports)} ports")
+                return host_id
+            except Exception as e:
+                logger.error(f"Failed to add host {ip_address} with its ports: {e}")
+                await self.connection.rollback()
+                raise
+
+    async def add_vulnerabilities_batch(self, host_id: int,
+                                        vulnerabilities: List[Dict[str, Any]]) -> int:
+        """
+        Add several vulnerabilities for one host in a single transaction.
+
+        Args:
+            host_id: The ID of the host the findings belong to.
+            vulnerabilities: Dictionaries with title, severity, description,
+                remediation, port and protocol keys.
+
+        Returns:
+            The number of rows inserted (0 for an empty list).
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected. Call connect() first.")
+
+        async with self._write_lock:
+            try:
+                if not vulnerabilities:
+                    return 0
+                await self.connection.executemany(
+                    """
+                    INSERT INTO vulnerabilities (host_id, title, severity, description, remediation, port, protocol)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            host_id,
+                            row.get("title"),
+                            row.get("severity"),
+                            row.get("description"),
+                            row.get("remediation"),
+                            row.get("port"),
+                            row.get("protocol"),
+                        )
+                        for row in vulnerabilities
+                    ]
+                )
+                await self.connection.commit()
+                logger.debug(f"Added {len(vulnerabilities)} vulnerabilities for host {host_id}")
+                return len(vulnerabilities)
+            except Exception as e:
+                logger.error(f"Failed to add vulnerabilities for host {host_id}: {e}")
+                await self.connection.rollback()
+                raise
 
     async def add_active_connections(self, scan_id: int, connections: List[Dict[str, Any]], status: str = "success") -> None:
         """
@@ -378,43 +515,120 @@ class DatabaseManager:
         if not self.connection:
             raise RuntimeError("Database not connected. Call connect() first.")
 
-        try:
-            timestamp = datetime.utcnow().isoformat()
-            for conn in connections:
-                await self.connection.execute(
-                    """
-                    INSERT INTO active_connections
-                    (scan_id, local_address, remote_address, remote_classification, pid, process_name, status, timestamp, collection_status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        scan_id,
-                        conn.get("local_address"),
-                        conn.get("remote_address"),
-                        conn.get("remote_classification"),
-                        conn.get("pid"),
-                        conn.get("process_name"),
-                        conn.get("status"),
-                        timestamp,
-                        status
+        async with self._write_lock:
+            try:
+                timestamp = datetime.now(timezone.utc).isoformat()
+                for conn in connections:
+                    await self.connection.execute(
+                        """
+                        INSERT INTO active_connections
+                        (scan_id, local_address, remote_address, remote_classification, pid, process_name, status, timestamp, collection_status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            scan_id,
+                            conn.get("local_address"),
+                            conn.get("remote_address"),
+                            conn.get("remote_classification"),
+                            conn.get("pid"),
+                            conn.get("process_name"),
+                            conn.get("status"),
+                            timestamp,
+                            status
+                        )
                     )
-                )
             
-            # If no connections but status is not success (failed/skipped), store a record
-            if not connections and status != "success":
-                 await self.connection.execute(
-                    """
-                    INSERT INTO active_connections
-                    (scan_id, local_address, remote_address, remote_classification, pid, process_name, status, timestamp, collection_status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (scan_id, "N/A", "N/A", "N/A", 0, "N/A", "N/A", timestamp, status)
-                )
+                # If no connections but status is not success (failed/skipped), store a record
+                if not connections and status != "success":
+                     await self.connection.execute(
+                        """
+                        INSERT INTO active_connections
+                        (scan_id, local_address, remote_address, remote_classification, pid, process_name, status, timestamp, collection_status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (scan_id, "N/A", "N/A", "N/A", 0, "N/A", "N/A", timestamp, status)
+                    )
 
-            await self.connection.commit()
-            logger.debug(f"Added {len(connections)} active connections for scan {scan_id} with status {status}")
+                await self.connection.commit()
+                logger.debug(f"Added {len(connections)} active connections for scan {scan_id} with status {status}")
+            except Exception as e:
+                logger.error(f"Failed to add active connections for scan {scan_id}: {e}")
+                await self.connection.rollback()
+                raise
+
+    async def add_derived_ports(self, scan_id: int, rows: List[Dict[str, Any]]) -> None:
+        """
+        Add derived port rows (from open-port scan results) for a scan.
+
+        These are not observed network connections; they are stored separately
+        from active_connections so reports can label their provenance.
+
+        Args:
+            scan_id: The ID of the scan.
+            rows: Dictionaries with ip_address, port and service_name keys.
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected. Call connect() first.")
+
+        if not rows:
+            return
+
+        async with self._write_lock:
+            try:
+                timestamp = datetime.now(timezone.utc).isoformat()
+                await self.connection.executemany(
+                    """
+                    INSERT INTO derived_ports (scan_id, ip_address, port, service_name, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (scan_id, row.get("ip_address"), row.get("port"),
+                         row.get("service_name"), timestamp)
+                        for row in rows
+                    ]
+                )
+                await self.connection.commit()
+                logger.debug(f"Added {len(rows)} derived ports for scan {scan_id}")
+            except Exception as e:
+                logger.error(f"Failed to add derived ports for scan {scan_id}: {e}")
+                await self.connection.rollback()
+                raise
+
+    async def get_derived_ports(self, scan_id: int) -> List[Dict[str, Any]]:
+        """
+        Retrieve derived port rows for a specific scan.
+
+        Args:
+            scan_id: The ID of the scan.
+
+        Returns:
+            A list of dictionaries ordered by ip_address, then port.
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected. Call connect() first.")
+
+        try:
+            cursor = await self.connection.execute(
+                """
+                SELECT ip_address, port, service_name, timestamp
+                FROM derived_ports
+                WHERE scan_id = ?
+                ORDER BY ip_address, port
+                """,
+                (scan_id,)
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "ip_address": row[0],
+                    "port": row[1],
+                    "service_name": row[2],
+                    "timestamp": row[3]
+                }
+                for row in rows
+            ]
         except Exception as e:
-            logger.error(f"Failed to add active connections for scan {scan_id}: {e}")
+            logger.error(f"Failed to retrieve derived ports for scan {scan_id}: {e}")
             raise
 
     async def get_hosts(self, scan_id: int) -> List[Dict[str, Any]]:
@@ -480,6 +694,15 @@ class DatabaseManager:
                 FROM vulnerabilities v
                 JOIN hosts h ON v.host_id = h.id
                 WHERE h.scan_id = ?
+                ORDER BY CASE UPPER(v.severity)
+                             WHEN 'CRITICAL' THEN 0
+                             WHEN 'HIGH' THEN 1
+                             WHEN 'MEDIUM' THEN 2
+                             WHEN 'LOW' THEN 3
+                             ELSE 4
+                         END,
+                         h.ip_address,
+                         v.port
                 """,
                 (scan_id,)
             )
@@ -522,6 +745,7 @@ class DatabaseManager:
                 FROM ports p
                 JOIN hosts h ON p.host_id = h.id
                 WHERE h.scan_id = ?
+                ORDER BY p.port_number
                 """,
                 (scan_id,)
             )

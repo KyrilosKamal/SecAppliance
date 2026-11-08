@@ -4,7 +4,7 @@ import ssl
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 from utils.logger import logger
 from core.database import DatabaseManager
@@ -85,7 +85,7 @@ class WebScanner:
             is_https: Whether to use HTTPS.
 
         Returns:
-            List of missing security headers with details.
+            Header security findings (present-when-harmful or absent-when-required).
         """
         if not self.session:
             raise RuntimeError("WebScanner must be used as an async context manager.")
@@ -114,21 +114,34 @@ class WebScanner:
             # Check each security header from signatures
             for header_info in self.signatures.get("headers", []):
                 header_name = header_info["name"]
-                if header_name not in headers:
-                    # Create a unique key for deduplication
-                    dedup_key = (host, port, f"missing_header_{header_name}")
-                    if dedup_key not in self.processed_vulns:
-                        self.processed_vulns.add(dedup_key)
-                        findings.append({
-                            "type": "missing_header",
-                            "header": header_name,
-                            "port": port,
-                            "protocol": "https" if is_https else "http",
-                            "severity": header_info["severity"],
-                            "description": header_info["description"],
-                            "remediation": header_info["remediation"],
-                            "url": url
-                        })
+
+                # HSTS is only meaningful on HTTPS responses
+                if header_info.get("https_only", False) and not is_https:
+                    continue
+
+                # "absent" headers are findings when missing; "present" headers
+                # (e.g. Server) are findings when disclosed.
+                expectation = header_info.get("type", "absent")
+                is_present = header_name in headers
+                is_finding = is_present if expectation == "present" else not is_present
+                if not is_finding:
+                    continue
+
+                finding_type = "present_header" if expectation == "present" else "missing_header"
+                # Create a unique key for deduplication
+                dedup_key = (host, port, f"{finding_type}_{header_name}")
+                if dedup_key not in self.processed_vulns:
+                    self.processed_vulns.add(dedup_key)
+                    findings.append({
+                        "type": finding_type,
+                        "header": header_name,
+                        "port": port,
+                        "protocol": "https" if is_https else "http",
+                        "severity": header_info["severity"],
+                        "description": header_info["description"],
+                        "remediation": header_info["remediation"],
+                        "url": url
+                    })
         except asyncio.TimeoutError:
             logger.warning(f"Timeout while checking headers for {url}")
         except Exception as e:
@@ -171,8 +184,10 @@ class WebScanner:
             if error_type:
                 self._add_ssl_finding(findings, host, port, error_type)
         except Exception:
-            # Non-certificate failures (e.g. refused, timeout) are handled below.
-            verified = True
+            # The handshake never completed (refused, timeout, protocol error), so
+            # the certificate was not verified. Proceed to the unverified probe so
+            # certificate details can still be reported.
+            verified = False
 
         # Grab certificate details with an unverified probe so expiration and
         # self-signed status can be reported even when validation fails.
@@ -193,7 +208,10 @@ class WebScanner:
                     if not_after:
                         try:
                             expiry_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
-                            now = datetime.utcnow()
+                            if expiry_date.tzinfo is None:
+                                # cert notAfter is GMT; strptime %Z yields a naive value
+                                expiry_date = expiry_date.replace(tzinfo=timezone.utc)
+                            now = datetime.now(timezone.utc)
                             if expiry_date < now:
                                 days_expired = (now - expiry_date).days
                                 self._add_ssl_finding(findings, host, port, "expired_certificate", {"days": days_expired})
@@ -282,12 +300,13 @@ class WebScanner:
 
                 all_findings = header_findings + ssl_findings
 
+                # Findings for this URL go in as one transaction under
+                # DatabaseManager's write lock. The title decoration is done
+                # here so the batch call stays a plain INSERT.
+                vuln_rows = []
                 for finding in all_findings:
                     # Determine if we have a title from the finding, otherwise generate one
                     title = finding.get("header", finding.get("type", "Web Vulnerability"))
-                    description = finding.get("description", "")
-                    remediation = finding.get("remediation", "")
-                    severity = finding.get("severity", "Info")
 
                     # Add port/protocol info to the title for better context
                     protocol = "https" if is_https else "http"
@@ -297,15 +316,16 @@ class WebScanner:
                     if f"Port {port}" not in title and f"port {port}" not in title.lower():
                         title = f"{title}{port_info}"
 
-                    # Insert vulnerability into the database
-                    await self.db.connection.execute(
-                        """
-                        INSERT INTO vulnerabilities (host_id, title, severity, description, remediation, port, protocol)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (host_id, title, severity, description, remediation, finding.get("port"), finding.get("protocol"))
-                    )
-                await self.db.connection.commit()
+                    vuln_rows.append({
+                        "title": title,
+                        "severity": finding.get("severity", "Info"),
+                        "description": finding.get("description", ""),
+                        "remediation": finding.get("remediation", ""),
+                        "port": finding.get("port"),
+                        "protocol": finding.get("protocol"),
+                    })
+
+                await self.db.add_vulnerabilities_batch(host_id, vuln_rows)
 
                 if all_findings:
                     logger.info(f"Found {len(all_findings)} web vulnerabilities on {url}")
@@ -314,24 +334,34 @@ class WebScanner:
 
             except Exception as e:
                 logger.error(f"Error scanning {url}: {e}")
-                await self.db.connection.rollback()
 
     async def scan_targets(self, targets: List[str], ports: List[int] = None, scan_id: int = None) -> None:
         """
-        Scan a list of target hosts for web vulnerabilities.
+        Scan the hosts stored for a scan for web vulnerabilities.
 
         Args:
-            targets: List of host IP addresses or hostnames.
+            targets: Retained for API compatibility; no longer used for discovery.
             ports: List of ports to scan (default: [80, 443, 8080, 8443]).
             scan_id: The ID of the scan to associate results with.
+
+        Raises:
+            ValueError: If scan_id is None.
         """
+        if scan_id is None:
+            raise ValueError("scan_id is required for web scanning")
+
         if ports is None:
             ports = [80, 443, 8080, 8443]
 
         if not self.session:
             raise RuntimeError("WebScanner must be used as an async context manager.")
 
-        for target in targets:
-            await self.scan_host(target, ports, scan_id)
+        hosts = await self.db.get_hosts(scan_id)
+        if not hosts:
+            logger.warning(f"No hosts stored for scan {scan_id}; nothing to web-scan.")
+            return
+
+        for row in hosts:
+            await self.scan_host(row["ip_address"], ports, scan_id)
 
         logger.info("Web scanning completed.")

@@ -1,7 +1,7 @@
 import json
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List
 from jinja2 import Environment, FileSystemLoader
 
@@ -110,6 +110,15 @@ class HTMLReportGenerator:
             FROM vulnerabilities v
             JOIN hosts h ON v.host_id = h.id
             WHERE h.scan_id = ?
+            ORDER BY CASE UPPER(v.severity)
+                         WHEN 'CRITICAL' THEN 0
+                         WHEN 'HIGH' THEN 1
+                         WHEN 'MEDIUM' THEN 2
+                         WHEN 'LOW' THEN 3
+                         ELSE 4
+                     END,
+                     h.ip_address,
+                     v.port
         """
         cursor = await self.db.connection.execute(query, (scan_id,))
         rows = await cursor.fetchall()
@@ -143,7 +152,7 @@ class HTMLReportGenerator:
         """
         try:
             cursor = await self.db.connection.execute(
-                "SELECT local_address, remote_address, remote_classification, pid, process_name, status, collection_status FROM active_connections WHERE scan_id = ?",
+                "SELECT local_address, remote_address, remote_classification, pid, process_name, status, collection_status, timestamp FROM active_connections WHERE scan_id = ?",
                 (scan_id,)
             )
             rows = await cursor.fetchall()
@@ -155,7 +164,8 @@ class HTMLReportGenerator:
                     "pid": row[3],
                     "process_name": row[4],
                     "status": row[5],
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    # Stored observation time, not the report-generation time.
+                    "timestamp": (row[7] if row[7] and row[7] != "N/A" else "N/A")
                 }
                 for row in rows if row[6] == "success"
             ]
@@ -172,6 +182,16 @@ class HTMLReportGenerator:
             logger.error(f"Failed to retrieve active connections for scan {scan_id}: {e}")
             return [], "error"
 
+    async def _get_derived_ports_data(self, scan_id: int) -> list:
+        """
+        Retrieve derived port rows (open-port scan results, not observed traffic).
+        """
+        try:
+            return await self.db.get_derived_ports(scan_id)
+        except Exception as e:
+            logger.error(f"Failed to retrieve derived ports for scan {scan_id}: {e}")
+            return []
+
     async def _prepare_template_data(self, scan_id: int) -> dict:
         """
         Prepare all data needed for the report template.
@@ -187,17 +207,47 @@ class HTMLReportGenerator:
         hosts_data = await self._get_hosts_data(scan_id)
         vulnerabilities_by_host, flat_vulnerabilities = await self._get_vulnerabilities_data(scan_id)
         active_connections, conn_status = await self._get_active_connections_data(scan_id)
+        derived_ports = await self._get_derived_ports_data(scan_id)
         port_data = await self.db.get_ports(scan_id)
+
+        # 1. Populate Recommendations & CVE Findings First (CVE severities feed the counts)
+        recommendations = []
+        cve_findings = []
+        for port_info in port_data:
+            port = port_info['port']
+            banner = port_info['banner']
+            service = port_info['service_name']
+
+            # CVE Lookup
+            vulns = get_vulns_for_service(service, banner)
+            for v in vulns:
+                cve_findings.append({
+                    "ip": port_info['ip_address'],
+                    "service": f"{service} ({banner})",
+                    "cve": v['cve'],
+                    "severity": v['severity'],
+                    "remediation": v['remediation']
+                })
+
+            # Check signatures for known port exposures
+            for port_sig in self.signatures.get("ports", []):
+                if port == port_sig["port"]:
+                    recommendations.append({
+                        "severity": port_sig["severity"],
+                        "title": port_sig["title"],
+                        "description": port_sig["description"]
+                    })
 
         # Calculate summary statistics
         total_hosts = len(hosts_data)
         total_open_ports = sum(h['open_ports_count'] for h in hosts_data)
-        total_vulnerabilities = len(flat_vulnerabilities)
+        # CVE findings count once per affected host/port match, matching the CVE table rows.
+        total_vulnerabilities = len(flat_vulnerabilities) + len(cve_findings)
 
-        # Calculate vulnerability breakdown by severity
+        # Calculate vulnerability breakdown by severity (web findings + CVE findings)
         vuln_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-        for vuln in flat_vulnerabilities:
-            severity = vuln["severity"].upper()  # Convert to uppercase for counting
+        for vuln in flat_vulnerabilities + cve_findings:
+            severity = (vuln.get("severity") or "INFO").strip().upper()
             if severity in vuln_counts:
                 vuln_counts[severity] += 1
             else:
@@ -227,39 +277,13 @@ class HTMLReportGenerator:
                 "color": color_map.get(severity, "#6B7280")
             }
 
-        # 1. Populate Recommendations & CVE Findings First
-        recommendations = []
-        cve_findings = []
-        for port_info in port_data:
-            port = port_info['port']
-            banner = port_info['banner']
-            service = port_info['service_name']
-            
-            # CVE Lookup
-            vulns = get_vulns_for_service(service, banner)
-            for v in vulns:
-                cve_findings.append({
-                    "ip": port_info['ip_address'],
-                    "service": f"{service} ({banner})",
-                    "cve": v['cve'],
-                    "severity": v['severity'],
-                    "remediation": v['remediation']
-                })
-
-            # Check signatures for known port exposures
-            for port_sig in self.signatures.get("ports", []):
-                if port == port_sig["port"]:
-                    recommendations.append({
-                        "severity": port_sig["severity"],
-                        "title": port_sig["title"],
-                        "description": port_sig["description"]
-                    })
-
-        # 2. Extract All Severities (Vulnerabilities + Recommendations)
+        # 2. Extract All Severities (Vulnerabilities + CVEs + Recommendations)
         all_severities = []
         for host_ip, vulns in vulnerabilities_by_host.items():
             for vuln in vulns:
                 all_severities.append(vuln.get("severity", "LOW").upper())
+        for cve in cve_findings:
+            all_severities.append(cve.get("severity", "LOW").upper())
         for rec in recommendations:
             all_severities.append(rec.get("severity", "LOW").upper())
 
@@ -292,21 +316,33 @@ class HTMLReportGenerator:
             risk_grade = "A"
             risk_level = "Low"
 
-        # Calculate scan duration
-        scan_start = datetime.fromisoformat(scan_data["start_time"].replace("Z", "+00:00"))
-        scan_end = datetime.fromisoformat(scan_data["end_time"].replace("Z", "+00:00")) if scan_data["end_time"] else datetime.now()
-        scan_duration_delta = scan_end - scan_start
+        # Calculate scan duration. Scan timestamps are stored as naive UTC ISO
+        # strings, so attach UTC before subtracting instead of assuming local time.
+        scan_duration = "N/A"
+        if scan_data.get("start_time") and scan_data.get("end_time"):
+            try:
+                scan_start = datetime.fromisoformat(scan_data["start_time"].replace("Z", "+00:00"))
+                if scan_start.tzinfo is None:
+                    scan_start = scan_start.replace(tzinfo=timezone.utc)
+                scan_end = datetime.fromisoformat(scan_data["end_time"].replace("Z", "+00:00"))
+                if scan_end.tzinfo is None:
+                    scan_end = scan_end.replace(tzinfo=timezone.utc)
+                scan_duration_delta = (
+                    scan_end.astimezone(timezone.utc) - scan_start.astimezone(timezone.utc)
+                )
 
-        # Format duration as HH:MM:SS or MM:SS
-        total_seconds = int(scan_duration_delta.total_seconds())
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        seconds = total_seconds % 60
+                # Format duration as HH:MM:SS or MM:SS
+                total_seconds = int(scan_duration_delta.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                seconds = total_seconds % 60
 
-        if hours > 0:
-            scan_duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        else:
-            scan_duration = f"{minutes:02d}:{seconds:02d}"
+                if hours > 0:
+                    scan_duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                else:
+                    scan_duration = f"{minutes:02d}:{seconds:02d}"
+            except (TypeError, ValueError) as exc:
+                logger.warning(f"Could not compute scan duration for scan {scan_id}: {exc}")
 
         # Prepare template data
         template_data = {
@@ -325,6 +361,7 @@ class HTMLReportGenerator:
             "hosts": hosts_data,
             "vulnerabilities_by_host": vulnerabilities_by_host,
             "active_connections": active_connections,
+            "derived_ports": derived_ports,
             "connection_status": conn_status,
             "ports": port_data,
             "cve_findings": cve_findings,

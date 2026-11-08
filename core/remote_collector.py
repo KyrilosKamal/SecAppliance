@@ -9,7 +9,8 @@ from utils.net_utils import map_tcp_state, classify_ip
 
 
 class RemoteCollector:
-    def __init__(self, accept_unknown_hosts: bool = False, accept_invalid_certs: bool = False):
+    def __init__(self, accept_unknown_hosts: bool = False, accept_invalid_certs: bool = False,
+                 allow_insecure_winrm_http: bool = False):
         """
         Initialize the remote collector.
 
@@ -18,11 +19,14 @@ class RemoteCollector:
                 When False (default), host keys are verified against known_hosts.
             accept_invalid_certs: When True, skip WinRM TLS certificate validation.
                 When False (default), certificates are validated.
+            allow_insecure_winrm_http: When True, use plaintext HTTP (port 5985) for WinRM.
+                When False (default), WinRM uses HTTPS (port 5986).
         """
         self.accept_unknown_hosts = accept_unknown_hosts
         self.accept_invalid_certs = accept_invalid_certs
+        self.allow_insecure_winrm_http = allow_insecure_winrm_http
 
-    def collect_connections(self, target_ip: str, username: str, password: str, auth_type: str = 'ssh') -> List[Dict[str, Any]]:
+    def collect_connections(self, target_ip: str, username: str, password: str, auth_type: str = 'winrm') -> List[Dict[str, Any]]:
         """
         Collect active network connections from a remote host.
         """
@@ -103,12 +107,24 @@ class RemoteCollector:
 
         cert_validation = 'ignore' if self.accept_invalid_certs else 'validate'
 
+        # HTTPS on 5986 by default so NTLM credentials are never sent in the clear.
+        if self.allow_insecure_winrm_http:
+            endpoint = f"http://{target_ip}:5985/wsman"
+            logger.warning(
+                f"WinRM on {target_ip} uses plaintext HTTP port 5985: NTLM credentials are sent "
+                "unencrypted. Drop --allow-insecure-winrm-http to use HTTPS on port 5986."
+            )
+        else:
+            endpoint = f"https://{target_ip}:5986/wsman"
+
         try:
             session = winrm.Session(
-                target_ip,
+                endpoint,
                 auth=(clean_username, password),
                 transport='ntlm',
-                server_cert_validation=cert_validation
+                server_cert_validation=cert_validation,
+                operation_timeout_sec=30,
+                read_timeout_sec=35,
             )
             ps_script = """
             $connections = Get-NetTCPConnection | Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, State, OwningProcess;
@@ -119,7 +135,7 @@ class RemoteCollector:
             };
             $result | ConvertTo-Json -Compress
             """
-            result = session.run_ps(ps_script, operation_timeout_sec=30, read_timeout_sec=35)
+            result = session.run_ps(ps_script)
 
             if result.status_code == 0:
                 data = json.loads(result.std_out.decode('utf-8'))

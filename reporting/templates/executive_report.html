@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <title>SecAppliance Security Report - Scan {{ scan_id }}</title>
     <style>
-        {{ css_content }}
+        {{ css_content|safe }}
     </style>
 </head>
 <body>
@@ -46,7 +46,7 @@
             <!-- Risk Assessment Box -->
             <div class="risk-assessment">
                 <div class="risk-badge-container">
-                    <div class="risk-badge risk-{{ risk_level|lower }}">{{ risk_grade }}</div>
+                    <div class="risk-badge {{ risk_level|lower }}">{{ risk_grade }}</div>
                     <div>
                         <div class="risk-level">Risk Level</div>
                         <div class="risk-gauge">
@@ -130,7 +130,7 @@
                     <div class="finding-header">
                         <h3 class="finding-title">{{ rec.title }}</h3>
                         <div class="finding-meta">
-                            <span class="severity-tag severity-{{ rec.severity|lower }}">{{ rec.severity }}</span>
+                            <span class="severity-tag {{ rec.severity|lower }}">{{ rec.severity }}</span>
                         </div>
                     </div>
                     <div class="finding-body">
@@ -165,7 +165,7 @@
                             <td>{{ cve.ip }}</td>
                             <td>{{ cve.service }}</td>
                             <td>{{ cve.cve }}</td>
-                            <td><span class="severity-tag severity-{{ cve.severity|lower }}">{{ cve.severity }}</span></td>
+                            <td><span class="severity-tag {{ cve.severity|lower }}">{{ cve.severity }}</span></td>
                             <td>{{ cve.remediation }}</td>
                         </tr>
                         {% endfor %}
@@ -189,7 +189,7 @@
                     <div class="finding-header">
                         <h3 class="finding-title">{{ vuln.title }}</h3>
                         <div class="finding-meta">
-                            <span class="severity-tag severity-{{ vuln.severity|lower }}">{{ vuln.severity }}</span>
+                            <span class="severity-tag {{ vuln.severity|lower }}">{{ vuln.severity }}</span>
                             <span class="finding-target">{{ host_ip }}:{{ vuln.port|default('N/A') }}/{{ vuln.protocol|default('TCP')|upper }}</span>
                         </div>
                     </div>
@@ -236,7 +236,7 @@
                 {% endfor %}
             </div>
         </section>
-        {% else %}
+        {% elif total_vulnerabilities == 0 %}
         <section class="vulnerability-details">
             <h2 class="section-title">No Vulnerabilities Found</h2>
             <div class="no-vulns-container">
@@ -270,7 +270,7 @@
                             <td>{{ conn.local_address }}</td>
                             <td>{{ conn.remote_address }}</td>
                             <td>
-                                <span class="classification-{{ conn.remote_classification|lower }}">
+                                <span class="classification-{{ conn.remote_classification|lower|replace('/', '-') }}">
                                     {{ conn.remote_classification }}
                                 </span>
                             </td>
@@ -298,6 +298,40 @@
                         An error occurred while attempting to collect active connections.
                     {% endif %}
                 </p>
+            </div>
+            {% endif %}
+        </section>
+
+        <!-- Derived Ports (provenance-labelled) -->
+        <section class="traffic-details">
+            <h2 class="section-title">Derived Ports (not observed traffic)</h2>
+            <p class="no-traffic-text">These rows are derived from open-port scan results and are not observed network connections. They are shown for completeness only.</p>
+            {% if derived_ports and derived_ports|length > 0 %}
+            <div class="traffic-container">
+                <table class="traffic-table">
+                    <thead>
+                        <tr>
+                            <th>IP</th>
+                            <th>Port</th>
+                            <th>Service</th>
+                            <th>Timestamp</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for dport in derived_ports %}
+                        <tr>
+                            <td>{{ dport.ip_address }}</td>
+                            <td>{{ dport.port }}</td>
+                            <td>{{ dport.service_name or 'Unknown' }}</td>
+                            <td>{{ dport.timestamp }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="no-traffic-container">
+                <p class="no-traffic-text">No derived port data.</p>
             </div>
             {% endif %}
         </section>

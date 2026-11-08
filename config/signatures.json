@@ -2,30 +2,40 @@
   "headers": [
     {
       "name": "Strict-Transport-Security",
+      "type": "absent",
+      "https_only": true,
       "severity": "Medium",
       "description": "HTTP Strict Transport Security (HSTS) is not set, which could allow SSL stripping attacks.",
       "remediation": "Configure your web server to include the Strict-Transport-Security header with a max-age of at least 31536000 seconds (1 year)."
     },
     {
       "name": "X-Frame-Options",
+      "type": "absent",
+      "https_only": false,
       "severity": "Medium",
       "description": "X-Frame-Options header is missing, which could allow clickjacking attacks.",
       "remediation": "Configure your web server to include the X-Frame-Options header with value DENY or SAMEORIGIN."
     },
     {
       "name": "X-Content-Type-Options",
+      "type": "absent",
+      "https_only": false,
       "severity": "Low",
       "description": "X-Content-Type-Options header is missing, which could lead to MIME type sniffing attacks.",
       "remediation": "Configure your web server to include the X-Content-Type-Options header with value nosniff."
     },
     {
       "name": "Content-Security-Policy",
+      "type": "absent",
+      "https_only": false,
       "severity": "High",
       "description": "Content-Security-Policy header is missing, which could allow cross-site scripting (XSS) and other code injection attacks.",
       "remediation": "Implement a Content Security Policy to restrict the sources of content that can be loaded on your web pages."
     },
     {
       "name": "Server",
+      "type": "present",
+      "https_only": false,
       "severity": "Low",
       "description": "Server header reveals potentially sensitive information about the web server technology and version.",
       "remediation": "Configure your web server to remove or obfuscate the Server header."

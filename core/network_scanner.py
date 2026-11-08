@@ -1,9 +1,10 @@
 import json
 import asyncio
 import ipaddress
+import itertools
 import socket
 import psutil
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Iterator
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from utils.logger import logger
@@ -11,14 +12,29 @@ from utils.net_utils import map_tcp_state, classify_ip
 from core.database import DatabaseManager
 
 
-def is_local(target: str) -> bool:
-    """Return True if the target refers to the local host."""
-    return target in ["127.0.0.1", "localhost", "::1"] or target == socket.gethostname()
+_LOCAL_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def is_local_target(target: str, hostname: str) -> bool:
+    """Return True if the target is a loopback name or the given hostname."""
+    return target in _LOCAL_NAMES or target == hostname
+
+
+async def is_local(target: str) -> bool:
+    """Return True if the target refers to the local host.
+
+    socket.gethostname() is a blocking syscall, so it runs off the event loop.
+    Callers that already know the hostname should use is_local_target().
+    """
+    if target in _LOCAL_NAMES:
+        return True
+    return is_local_target(target, await asyncio.to_thread(socket.gethostname))
 
 
 class NetworkScanner:
     def __init__(self, db_manager: DatabaseManager, max_concurrent: int = 200, timeout: float = 3.0, verbose: bool = False,
-                 accept_unknown_hosts: bool = False, accept_invalid_certs: bool = False):
+                 accept_unknown_hosts: bool = False, accept_invalid_certs: bool = False, force: bool = False,
+                 allow_insecure_winrm_http: bool = False):
         """
         Initialize the network scanner.
 
@@ -29,6 +45,8 @@ class NetworkScanner:
             verbose: Enable debug logging.
             accept_unknown_hosts: Passed to RemoteCollector (SSH host key verification).
             accept_invalid_certs: Passed to RemoteCollector (WinRM cert validation).
+            force: Allow scanning CIDR ranges larger than /16.
+            allow_insecure_winrm_http: Passed to RemoteCollector (allow plaintext HTTP WinRM).
         """
         self.db = db_manager
         self.max_concurrent = max_concurrent
@@ -37,6 +55,8 @@ class NetworkScanner:
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.accept_unknown_hosts = accept_unknown_hosts
         self.accept_invalid_certs = accept_invalid_certs
+        self.force = force
+        self.allow_insecure_winrm_http = allow_insecure_winrm_http
 
         # Common ports to scan with associated service names for banner grabbing hints
         self.common_ports = {
@@ -146,9 +166,13 @@ class NetworkScanner:
                 logger.debug(f"Unexpected error scanning {ip}:{port} - {e}")
                 return None
 
-    def get_active_connections(self, scan_id: int = None) -> List[Dict[str, Any]]:
+    async def get_active_connections(self, scan_id: int = None) -> List[Dict[str, Any]]:
         """
         Get active network connections on the local host.
+
+        psutil.net_connections() and Process().name() are blocking, so the whole
+        collection runs in a worker thread. Callers stay on the event loop and
+        must await this; the DB write happens after it returns.
 
         Args:
             scan_id: Unused; kept for interface compatibility.
@@ -156,6 +180,10 @@ class NetworkScanner:
         Returns:
             List of dictionaries containing connection information.
         """
+        return await asyncio.to_thread(self._get_active_connections_sync, scan_id)
+
+    def _get_active_connections_sync(self, scan_id: int = None) -> List[Dict[str, Any]]:
+        """Blocking body of get_active_connections; must run off the event loop."""
         connections = []
         try:
             # Get all network connections
@@ -207,9 +235,14 @@ class NetworkScanner:
                     from core.remote_collector import RemoteCollector
                     collector = RemoteCollector(
                         accept_unknown_hosts=self.accept_unknown_hosts,
-                        accept_invalid_certs=self.accept_invalid_certs
+                        accept_invalid_certs=self.accept_invalid_certs,
+                        allow_insecure_winrm_http=self.allow_insecure_winrm_http,
                     )
-                    connections = collector.collect_connections(
+                    # paramiko / pywinrm are blocking; run the collector off the
+                    # event loop so the progress bar and parallel hosts are not
+                    # frozen for the whole SSH/WinRM round trip.
+                    connections = await asyncio.to_thread(
+                        collector.collect_connections,
                         target,
                         credentials["username"],
                         credentials["password"],
@@ -217,41 +250,42 @@ class NetworkScanner:
                     )
                     if not connections:
                         # Fallback if empty and local
-                        if is_local(target):
+                        if await is_local(target):
                             logger.info("[Local Fallback] WinRM unavailable/bypassed. Retrieving active sockets directly via psutil.")
-                            connections = self.get_active_connections(scan_id)
+                            connections = await self.get_active_connections(scan_id)
                         else:
                             status = "failed"
                 except Exception as e:
                     # Fallback on remote failure if local
-                    if is_local(target):
+                    if await is_local(target):
                         logger.info(f"[Local Fallback] WinRM error ({e}). Retrieving active sockets directly via psutil.")
-                        connections = self.get_active_connections(scan_id)
+                        connections = await self.get_active_connections(scan_id)
                     else:
                         status = "failed"
             else:
                 # Unauthenticated: Only collect if target is local
-                if is_local(target):
-                    connections = self.get_active_connections(scan_id)
+                if await is_local(target):
+                    connections = await self.get_active_connections(scan_id)
                 else:
                     status = "skipped"
 
-            # Dynamic Open Port Fallback mapping if no active connections were found
+            # No observed connections: store open ports as derived data in their
+            # own table so the report never presents them as observed traffic.
             if not connections:
-                logger.info(f"No active network connections captured. Initiating dynamic fallback mapping for open ports.")
+                logger.info(f"No active network connections captured. Recording derived port data for open ports.")
                 try:
                     open_ports = await self.db.get_ports(scan_id)
-                    for port_info in open_ports:
-                        connections.append({
-                            "local_address": f"{port_info['ip_address']}:{port_info['port']}",
-                            "remote_address": "0.0.0.0:*",
-                            "remote_classification": "LAN",
-                            "pid": 0,
-                            "process_name": f"Listening Service ({port_info['service_name']})",
-                            "status": "LISTEN"
-                        })
+                    derived_rows = [
+                        {
+                            "ip_address": port_info["ip_address"],
+                            "port": port_info["port"],
+                            "service_name": port_info["service_name"]
+                        }
+                        for port_info in open_ports
+                    ]
+                    await self.db.add_derived_ports(scan_id, derived_rows)
                 except Exception as db_err:
-                    logger.error(f"Failed to query database for open port fallback: {db_err}")
+                    logger.error(f"Failed to store derived port data: {db_err}")
 
             await self.db.add_active_connections(scan_id, connections, status)
             logger.info(f"Collected {len(connections)} connections for scan {scan_id} (Status: {status})")
@@ -308,25 +342,78 @@ class NetworkScanner:
             # Fallback to IP address
             hostname = ip
 
-        # Store host information in the database
+        # Store host information in the database. The host row and all of its
+        # ports go in as one transaction under DatabaseManager's write lock, so
+        # a host with many open ports costs one commit instead of one per port.
         try:
-            host_id = await self.db.add_host(scan_id, ip, is_alive, hostname)
-
-            # Store each open port
-            for port, protocol, banner, service_info in open_ports:
-                await self.db.add_port(
-                    host_id,
-                    port,
-                    protocol,
-                    service_info.get("service_name", "unknown"),
-                    banner,
-                    json.dumps(service_info) if service_info else None
-                )
-            await self.db.connection.commit()
+            ports_list = [
+                {
+                    "port_number": port,
+                    "protocol": protocol,
+                    "service_name": service_info.get("service_name", "unknown"),
+                    "banner": banner,
+                    "service_info": json.dumps(service_info) if service_info else None,
+                }
+                for port, protocol, banner, service_info in open_ports
+            ]
+            await self.db.add_host_with_ports(scan_id, ip, is_alive, hostname, ports_list)
             logger.info(f"Host {ip} stored with {len(open_ports)} open ports.")
         except Exception as e:
             logger.error(f"Failed to store host {ip} in database: {e}")
-            await self.db.connection.rollback()
+
+    def _validate_target_sizes(self, targets: List[str]) -> None:
+        """Reject CIDR ranges larger than /16 unless force is enabled."""
+        if self.force:
+            return
+        for target in targets:
+            try:
+                network = ipaddress.ip_network(target, strict=False)
+            except ValueError:
+                continue
+            if network.prefixlen >= 16:
+                continue
+            total = network.num_addresses
+            if network.version == 4:
+                host_count = total - 2 if network.prefixlen <= 30 else total
+            else:
+                host_count = total - 1 if network.prefixlen <= 126 else total
+            raise ValueError(
+                f"Target '{target}' is a /{network.prefixlen} range with {host_count} addresses, "
+                f"which exceeds the /16 limit. Pass --force to scan ranges larger than /16."
+            )
+
+    def _iter_hosts(self, targets: List[str]) -> Iterator[str]:
+        """Yield hosts lazily without materializing the full expansion.
+
+        Targets are deduplicated by string only, so overlapping CIDR ranges may
+        still yield the same host more than once.
+        """
+        seen_targets = set()
+        for target in targets:
+            if target in seen_targets:
+                continue
+            seen_targets.add(target)
+            try:
+                network = ipaddress.ip_network(target, strict=False)
+            except ValueError:
+                yield target
+                continue
+            for ip in network.hosts():
+                yield str(ip)
+
+    def _iter_work_items(self, targets: List[str], scan_id: int, ports: List[int],
+                         credentials: Optional[Dict[str, str]] = None,
+                         local_hostname: str = "") -> Iterator[Tuple[Any, Tuple[Any, ...]]]:
+        """Yield (callable, args) work items lazily over the target expansion.
+
+        This is a sync generator, so it cannot await the hostname lookup; the
+        caller resolves local_hostname once, off the event loop, and passes it in.
+        """
+        for ip in self._iter_hosts(targets):
+            yield (self.scan_host, (ip, scan_id, ports))
+            # Also collect connections if credentials provided OR if target is local
+            if credentials or is_local_target(ip, local_hostname):
+                yield (self.collect_and_store_active_connections, (scan_id, ip, credentials))
 
     async def scan_targets(self, targets: List[str], scan_id: int, ports: List[int] = None, credentials: Optional[Dict[str, str]] = None) -> None:
         """
@@ -335,23 +422,15 @@ class NetworkScanner:
         if ports is None:
             ports = list(self.common_ports.keys())
 
-        # Expand CIDR ranges
-        ips_to_scan = set()
-        for target in targets:
-            try:
-                network = ipaddress.ip_network(target, strict=False)
-                ips_to_scan.update(str(ip) for ip in network.hosts())
-            except ValueError:
-                ips_to_scan.add(target)
+        self._validate_target_sizes(targets)
 
-        # Build work items without spawning tasks up-front so large target
-        # ranges do not exhaust memory.
-        work_items = []
-        for ip in ips_to_scan:
-            work_items.append((self.scan_host, (ip, scan_id, ports)))
-            # Also collect connections if credentials provided OR if target is local
-            if credentials or is_local(ip):
-                work_items.append((self.collect_and_store_active_connections, (scan_id, ip, credentials)))
+        # Resolve the local hostname once, off the event loop, instead of once
+        # per host inside the sync work-item generator.
+        local_hostname = await asyncio.to_thread(socket.gethostname)
+
+        # Work items are generated lazily so large target ranges do not
+        # exhaust memory.
+        work_items = self._iter_work_items(targets, scan_id, ports, credentials, local_hostname)
 
         # Wait for all tasks to complete concurrently with progress bar,
         # processing in bounded batches.
@@ -362,11 +441,13 @@ class NetworkScanner:
             TaskProgressColumn(),
             transient=True,
         ) as progress:
-            task_id = progress.add_task(description="Scanning network...", total=len(work_items))
+            task_id = progress.add_task(description="Scanning network...", total=None)
 
             batch_size = max(self.max_concurrent, 1)
-            for start in range(0, len(work_items), batch_size):
-                batch = work_items[start:start + batch_size]
+            while True:
+                batch = list(itertools.islice(work_items, batch_size))
+                if not batch:
+                    break
 
                 async def run_batch(batch):
                     tasks = [asyncio.create_task(fn(*args)) for fn, args in batch]
