@@ -8,12 +8,12 @@
 **SecAppliance** is a professional-grade network security scanner designed for automated vulnerability assessment and reconnaissance. It combines high-performance asynchronous scanning with offline CVE mapping and credentialed auditing.
 
 ##  Key Features
-- ** Async Scanning**: High-performance, asynchronous scanning engine for rapid target assessment.
-- ** Offline CVE Mapping**: Localized, signature-based vulnerability detection requiring no external API dependencies.
-- ** Credentialed Audit Mode**: Supports SSH and WinRM for deep, authenticated configuration auditing.
-- ** HTML Reporting**: Automated, professional-grade executive reports in HTML format.
-- ** CLI Interface**: Intuitive command-line interface for seamless integration into automation workflows.
-- ** Secure by Default**: SSH host keys are verified against `known_hosts`, and WinRM/web TLS certificates are validated by default. Passwords are never accepted via CLI arguments.
+- Async Scanning**: High-performance, asynchronous scanning engine for rapid target assessment.
+- Offline CVE Mapping**: Localized, signature-based vulnerability detection requiring no external API dependencies.
+- Credentialed Audit Mode**: Supports SSH and WinRM for deep, authenticated configuration auditing.
+- HTML Reporting**: Automated, professional-grade executive reports in HTML format.
+- CLI Interface**: Intuitive command-line interface for seamless integration into automation workflows.
+- Secure by Default**: SSH host keys are verified against `known_hosts`, and WinRM/web TLS certificates are validated by default. Passwords are never accepted via CLI arguments.
 
 ## Prerequisites
 - Python **3.11** or higher. The pinned dependency set requires it (`platformdirs` 4.14.5 needs 3.11+; `click` 8.5.1, `aiohttp` 3.14.5, and `typer` 0.28.0 need 3.10+).
