@@ -1,11 +1,16 @@
+<div align="center">
 
-# 🛡️ SecAppliance
+# SecAppliance
 
 ![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Code Review](https://img.shields.io/badge/code%20review-25%20items%20resolved-success)
 
+
+</div>
+
 **SecAppliance** is a professional-grade network security scanner designed for automated vulnerability assessment and reconnaissance. It combines high-performance asynchronous scanning with offline CVE mapping and credentialed auditing.
+
 
 ##  Key Features
 - Async Scanning**: High-performance, asynchronous scanning engine for rapid target assessment.
