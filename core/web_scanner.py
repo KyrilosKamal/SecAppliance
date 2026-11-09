@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from utils.logger import logger
 from core.database import DatabaseManager
+from core.online_cve import lookup_with_cache
 
 
 def _resolve_path(path: str) -> Path:
@@ -75,7 +76,7 @@ class WebScanner:
             context.verify_mode = ssl.CERT_NONE
         return context
 
-    async def check_headers(self, host: str, port: int, is_https: bool) -> List[Dict[str, str]]:
+    async def check_headers(self, host: str, port: int, is_https: bool) -> Tuple[List[Dict[str, str]], Optional[str]]:
         """
         Check HTTP headers for missing security controls.
 
@@ -85,7 +86,7 @@ class WebScanner:
             is_https: Whether to use HTTPS.
 
         Returns:
-            Header security findings (present-when-harmful or absent-when-required).
+            A tuple of (header security findings, raw Server header value or None).
         """
         if not self.session:
             raise RuntimeError("WebScanner must be used as an async context manager.")
@@ -93,6 +94,7 @@ class WebScanner:
         scheme = "https" if is_https else "http"
         url = f"{scheme}://{host}:{port}"
         findings = []
+        server_header: Optional[str] = None
 
         ssl_context = None
         if is_https:
@@ -110,6 +112,10 @@ class WebScanner:
                 insecure_context = self._get_ssl_context(verify=False)
                 async with self.session.get(url, ssl=insecure_context, allow_redirects=True) as response:
                     headers = response.headers
+
+            # Kept alongside the findings: the banner is CIRCL lookup input even
+            # when the Server header itself is not a finding.
+            server_header = headers.get("Server")
 
             # Check each security header from signatures
             for header_info in self.signatures.get("headers", []):
@@ -147,7 +153,7 @@ class WebScanner:
         except Exception as e:
             logger.debug(f"Error checking headers for {url}: {e}")
 
-        return findings
+        return findings, server_header
 
     @staticmethod
     def _classify_cert_error(error: ssl.SSLCertVerificationError) -> Optional[str]:
@@ -284,6 +290,7 @@ class WebScanner:
             logger.warning(f"Host {host} not found in database for scan {scan_id}. Skipping web scan.")
             return
         host_id = row[0]
+        seen_cves: Set[str] = set()
 
         for port in ports:
             # Determine if we should use HTTPS based on common SSL ports
@@ -292,7 +299,7 @@ class WebScanner:
 
             try:
                 # Check headers
-                header_findings = await self.check_headers(host, port, is_https)
+                header_findings, server_header = await self.check_headers(host, port, is_https)
                 # Check SSL/TLS (only for HTTPS ports)
                 ssl_findings = []
                 if is_https:
@@ -331,6 +338,22 @@ class WebScanner:
                     logger.info(f"Found {len(all_findings)} web vulnerabilities on {url}")
                 else:
                     logger.debug(f"No web vulnerabilities found on {url}")
+
+                # Additional layer: online CVE enrichment from the Server header.
+                # Failure here must never fail the scan.
+                if server_header and scan_id:
+                    try:
+                        online = await lookup_with_cache(self.session, self.db, server_header)
+                    except Exception as lookup_err:
+                        logger.warning(f"Online CVE lookup skipped for {url}: {lookup_err}")
+                        online = []
+                    new_findings = [c for c in online if c["cve_id"] not in seen_cves]
+                    if new_findings:
+                        try:
+                            await self.db.add_online_cves(host_id, new_findings)
+                            seen_cves.update(c["cve_id"] for c in new_findings)
+                        except Exception as db_err:
+                            logger.error(f"Failed to store online CVEs for {url}: {db_err}")
 
             except Exception as e:
                 logger.error(f"Error scanning {url}: {e}")

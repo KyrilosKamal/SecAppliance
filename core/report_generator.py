@@ -182,6 +182,14 @@ class HTMLReportGenerator:
             logger.error(f"Failed to retrieve active connections for scan {scan_id}: {e}")
             return [], "error"
 
+    async def _get_online_cves_data(self, scan_id: int) -> list:
+        """Retrieve OSINT CVE findings (CIRCL) for a scan; never fails the report."""
+        try:
+            return await self.db.get_online_cves(scan_id)
+        except Exception as e:
+            logger.error(f"Failed to retrieve online CVEs for scan {scan_id}: {e}")
+            return []
+
     async def _get_derived_ports_data(self, scan_id: int) -> list:
         """
         Retrieve derived port rows (open-port scan results, not observed traffic).
@@ -208,6 +216,7 @@ class HTMLReportGenerator:
         vulnerabilities_by_host, flat_vulnerabilities = await self._get_vulnerabilities_data(scan_id)
         active_connections, conn_status = await self._get_active_connections_data(scan_id)
         derived_ports = await self._get_derived_ports_data(scan_id)
+        online_cves = await self._get_online_cves_data(scan_id)
         port_data = await self.db.get_ports(scan_id)
 
         # 1. Populate Recommendations & CVE Findings First (CVE severities feed the counts)
@@ -365,6 +374,10 @@ class HTMLReportGenerator:
             "connection_status": conn_status,
             "ports": port_data,
             "cve_findings": cve_findings,
+            "online_cves": online_cves,
+            # Reported as its own KPI: these are OSINT product/version matches and
+            # must not silently inflate the offline-signature total or risk score.
+            "online_cves_count": len(online_cves),
             "recommendations": recommendations,
             "report_generated_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "assessor": "SecAppliance Automated Scanner"

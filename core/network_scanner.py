@@ -4,12 +4,19 @@ import ipaddress
 import itertools
 import socket
 import psutil
+import aiohttp
 from typing import List, Optional, Tuple, Dict, Any, Iterator
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from utils.logger import logger
 from utils.net_utils import map_tcp_state, classify_ip
 from core.database import DatabaseManager
+from core.online_cve import (
+    MAX_RESULTS,
+    banner_key,
+    lookup_with_cache,
+    parse_banner,
+)
 
 
 _LOCAL_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -57,6 +64,9 @@ class NetworkScanner:
         self.accept_invalid_certs = accept_invalid_certs
         self.force = force
         self.allow_insecure_winrm_http = allow_insecure_winrm_http
+        # Created lazily on the first banner with an online CVE lookup and closed
+        # by scan_targets; None means no request has been made yet.
+        self.session: Optional[aiohttp.ClientSession] = None
 
         # Common ports to scan with associated service names for banner grabbing hints
         self.common_ports = {
@@ -95,6 +105,47 @@ class NetworkScanner:
             3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL", 5900: "VNC",
             8080: "HTTP-Proxy", 8443: "HTTPS-Alt"
         }
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Return the shared HTTP session, creating it on first use."""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+
+    async def close(self) -> None:
+        """Close the HTTP session if this scanner opened one."""
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
+        self.session = None
+
+    async def _enrich_online_cves(self, host_id: int, open_ports: List[Tuple[int, str, str, Dict[str, Any]]]) -> None:
+        """Look the banners up on CIRCL and store the findings for one host.
+
+        Enrichment is best-effort: any failure is logged and the scan continues.
+        """
+        try:
+            session = await self._get_session()
+            findings: List[Dict[str, Any]] = []
+            seen_keys = set()
+            for _port, _protocol, banner, _service_info in open_ports:
+                parsed = parse_banner(banner)
+                if not parsed:
+                    continue
+                key = banner_key(*parsed)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                findings.extend(await lookup_with_cache(session, self.db, banner))
+
+            # One row per CVE per host, even when several ports share a banner.
+            unique: Dict[str, Dict[str, Any]] = {}
+            for finding in findings:
+                unique.setdefault(finding["cve_id"], finding)
+            if unique:
+                await self.db.add_online_cves(host_id, list(unique.values())[:MAX_RESULTS])
+                logger.info(f"Stored {len(unique)} online CVE finding(s) for host {host_id}")
+        except Exception as e:
+            logger.warning(f"Online CVE enrichment skipped for host {host_id}: {e}")
 
     async def scan_port(self, ip: str, port: int) -> Optional[Tuple[int, str, str, Dict[str, Any]]]:
         """
@@ -282,6 +333,7 @@ class NetworkScanner:
                             "service_name": port_info["service_name"]
                         }
                         for port_info in open_ports
+                        if port_info["ip_address"] == target
                     ]
                     await self.db.add_derived_ports(scan_id, derived_rows)
                 except Exception as db_err:
@@ -356,10 +408,15 @@ class NetworkScanner:
                 }
                 for port, protocol, banner, service_info in open_ports
             ]
-            await self.db.add_host_with_ports(scan_id, ip, is_alive, hostname, ports_list)
+            host_id = await self.db.add_host_with_ports(scan_id, ip, is_alive, hostname, ports_list)
             logger.info(f"Host {ip} stored with {len(open_ports)} open ports.")
         except Exception as e:
             logger.error(f"Failed to store host {ip} in database: {e}")
+            return
+
+        # Additional layer only: the offline signatures in the report are unaffected.
+        if scan_id and open_ports:
+            await self._enrich_online_cves(host_id, open_ports)
 
     def _validate_target_sizes(self, targets: List[str]) -> None:
         """Reject CIDR ranges larger than /16 unless force is enabled."""
@@ -401,19 +458,25 @@ class NetworkScanner:
             for ip in network.hosts():
                 yield str(ip)
 
-    def _iter_work_items(self, targets: List[str], scan_id: int, ports: List[int],
-                         credentials: Optional[Dict[str, str]] = None,
-                         local_hostname: str = "") -> Iterator[Tuple[Any, Tuple[Any, ...]]]:
-        """Yield (callable, args) work items lazily over the target expansion.
+    async def _scan_host_and_collect(self, ip: str, scan_id: int, ports: List[int],
+                                     credentials: Optional[Dict[str, str]] = None) -> None:
+        """Scan one host, then map its connections, in that order.
 
-        This is a sync generator, so it cannot await the hostname lookup; the
-        caller resolves local_hostname once, off the event loop, and passes it in.
+        Sequential because the derived-port fallback reads this host's ports
+        back from the database; as separate concurrent work items the reader
+        could run before the writer.
         """
+        await self.scan_host(ip, scan_id, ports)
+        await self.collect_and_store_active_connections(scan_id, ip, credentials)
+
+    def _iter_work_items(self, targets: List[str], scan_id: int, ports: List[int],
+                         credentials: Optional[Dict[str, str]] = None) -> Iterator[Tuple[Any, Tuple[Any, ...]]]:
+        """Yield (callable, args) work items lazily over the target expansion."""
         for ip in self._iter_hosts(targets):
-            yield (self.scan_host, (ip, scan_id, ports))
-            # Also collect connections if credentials provided OR if target is local
-            if credentials or is_local_target(ip, local_hostname):
-                yield (self.collect_and_store_active_connections, (scan_id, ip, credentials))
+            # Connection mapping runs for every target: an unauthenticated
+            # remote host records status "skipped" and falls back to derived
+            # ports, which is what populates the report for public targets.
+            yield (self._scan_host_and_collect, (ip, scan_id, ports, credentials))
 
     async def scan_targets(self, targets: List[str], scan_id: int, ports: List[int] = None, credentials: Optional[Dict[str, str]] = None) -> None:
         """
@@ -424,36 +487,35 @@ class NetworkScanner:
 
         self._validate_target_sizes(targets)
 
-        # Resolve the local hostname once, off the event loop, instead of once
-        # per host inside the sync work-item generator.
-        local_hostname = await asyncio.to_thread(socket.gethostname)
-
         # Work items are generated lazily so large target ranges do not
         # exhaust memory.
-        work_items = self._iter_work_items(targets, scan_id, ports, credentials, local_hostname)
+        work_items = self._iter_work_items(targets, scan_id, ports, credentials)
 
         # Wait for all tasks to complete concurrently with progress bar,
         # processing in bounded batches.
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            transient=True,
-        ) as progress:
-            task_id = progress.add_task(description="Scanning network...", total=None)
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                transient=True,
+            ) as progress:
+                task_id = progress.add_task(description="Scanning network...", total=None)
 
-            batch_size = max(self.max_concurrent, 1)
-            while True:
-                batch = list(itertools.islice(work_items, batch_size))
-                if not batch:
-                    break
+                batch_size = max(self.max_concurrent, 1)
+                while True:
+                    batch = list(itertools.islice(work_items, batch_size))
+                    if not batch:
+                        break
 
-                async def run_batch(batch):
-                    tasks = [asyncio.create_task(fn(*args)) for fn, args in batch]
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    async def run_batch(batch):
+                        tasks = [asyncio.create_task(fn(*args)) for fn, args in batch]
+                        await asyncio.gather(*tasks, return_exceptions=True)
 
-                await run_batch(batch)
-                progress.update(task_id, advance=len(batch))
+                    await run_batch(batch)
+                    progress.update(task_id, advance=len(batch))
+        finally:
+            await self.close()
 
         logger.info("Network scanning and connection collection completed.")

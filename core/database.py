@@ -2,9 +2,18 @@ import asyncio
 import aiosqlite
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from utils.logger import logger
+
+def _parse_timestamp(value: str) -> Optional[datetime]:
+    """Parse a stored ISO timestamp; assume UTC when the value carries no zone."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
 
 class DatabaseManager:
     """Async-compatible SQLite manager for SecAppliance."""
@@ -161,6 +170,36 @@ class DatabaseManager:
                         FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
                     )
                 """)
+
+                # CVE enrichment cache: one row per unique banner key, refetched
+                # lazily once the row is older than 7 days. Shared by scans
+                # because a banner identifies a product/version, not a host.
+                await self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS cve_cache (
+                        banner_key TEXT PRIMARY KEY,
+                        results_json TEXT NOT NULL,
+                        timestamp TEXT NOT NULL
+                    )
+                """)
+
+                # Online CVE findings resolved against the CIRCL API. Separate
+                # from `vulnerabilities` (offline signatures) so the two layers
+                # stay distinguishable in reports.
+                await self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS online_cves (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        host_id INTEGER NOT NULL,
+                        cve_id TEXT NOT NULL,
+                        summary TEXT,
+                        severity TEXT,
+                        cvss_score REAL,
+                        timestamp TEXT NOT NULL,
+                        FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE
+                    )
+                """)
+                await self.connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_online_cves_host_id ON online_cves(host_id)"
+                )
 
                 # Indexes for the lookup columns every report/host/port query filters
                 # on. hosts gets a composite because web_scanner looks a host up by
@@ -629,6 +668,157 @@ class DatabaseManager:
             ]
         except Exception as e:
             logger.error(f"Failed to retrieve derived ports for scan {scan_id}: {e}")
+            raise
+
+    async def get_cached_cves(self, banner_key: str) -> Optional[str]:
+        """
+        Return the cached CVE JSON for a banner key, or None if missing or stale.
+
+        Args:
+            banner_key: Normalised product/version key (see core.online_cve).
+
+        Returns:
+            The cached JSON string, or None when absent or older than 7 days.
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected. Call connect() first.")
+
+        try:
+            cursor = await self.connection.execute(
+                "SELECT results_json, timestamp FROM cve_cache WHERE banner_key = ?",
+                (banner_key,)
+            )
+            row = await cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Failed to read CVE cache for '{banner_key}': {e}")
+            raise
+
+        if not row:
+            return None
+
+        cached_at = _parse_timestamp(row[1])
+        if cached_at is None:
+            # Unreadable timestamp: treat the entry as stale rather than trusting it.
+            logger.debug(f"Unparseable CVE cache timestamp for '{banner_key}': {row[1]!r}")
+            return None
+        if datetime.now(timezone.utc) - cached_at > timedelta(days=7):
+            return None
+        return row[0]
+
+    async def cache_cves(self, banner_key: str, results_json: str) -> None:
+        """
+        Store or replace the CVE JSON for a banner key, stamped with the current time.
+
+        Args:
+            banner_key: Normalised product/version key (see core.online_cve).
+            results_json: The JSON string to cache.
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected. Call connect() first.")
+
+        async with self._write_lock:
+            try:
+                await self.connection.execute(
+                    """
+                    INSERT OR REPLACE INTO cve_cache (banner_key, results_json, timestamp)
+                    VALUES (?, ?, ?)
+                    """,
+                    (banner_key, results_json, datetime.now(timezone.utc).isoformat())
+                )
+                await self.connection.commit()
+                logger.debug(f"Cached CVE results for '{banner_key}'")
+            except Exception as e:
+                logger.error(f"Failed to cache CVE results for '{banner_key}': {e}")
+                await self.connection.rollback()
+                raise
+
+    async def add_online_cves(self, host_id: int, cves: List[Dict[str, Any]]) -> None:
+        """
+        Store online CVE findings for one host in a single transaction.
+
+        Args:
+            host_id: The ID of the host the findings belong to.
+            cves: Dictionaries with cve_id, summary, severity and cvss_score keys.
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected. Call connect() first.")
+
+        if not cves:
+            return
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        async with self._write_lock:
+            try:
+                await self.connection.executemany(
+                    """
+                    INSERT INTO online_cves
+                    (host_id, cve_id, summary, severity, cvss_score, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            host_id,
+                            row.get("cve_id"),
+                            row.get("summary"),
+                            row.get("severity"),
+                            row.get("cvss_score"),
+                            timestamp,
+                        )
+                        for row in cves
+                    ]
+                )
+                await self.connection.commit()
+                logger.debug(f"Added {len(cves)} online CVE findings for host {host_id}")
+            except Exception as e:
+                logger.error(f"Failed to add online CVE findings for host {host_id}: {e}")
+                await self.connection.rollback()
+                raise
+
+    async def get_online_cves(self, scan_id: int) -> List[Dict[str, Any]]:
+        """
+        Retrieve online CVE findings for a scan, most severe first.
+
+        Args:
+            scan_id: The ID of the scan.
+
+        Returns:
+            Dictionaries with ip_address, cve_id, summary, severity and cvss_score.
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected. Call connect() first.")
+
+        try:
+            cursor = await self.connection.execute(
+                """
+                SELECT h.ip_address, o.cve_id, o.summary, o.severity, o.cvss_score
+                FROM online_cves o
+                JOIN hosts h ON o.host_id = h.id
+                WHERE h.scan_id = ?
+                ORDER BY CASE UPPER(o.severity)
+                             WHEN 'CRITICAL' THEN 0
+                             WHEN 'HIGH' THEN 1
+                             WHEN 'MEDIUM' THEN 2
+                             WHEN 'LOW' THEN 3
+                             ELSE 4
+                         END,
+                         h.ip_address,
+                         o.cvss_score DESC
+                """,
+                (scan_id,)
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "ip_address": row[0],
+                    "cve_id": row[1],
+                    "summary": row[2] or "",
+                    "severity": row[3] or "UNKNOWN",
+                    "cvss_score": row[4] if row[4] is not None else 0.0,
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"Failed to retrieve online CVEs for scan {scan_id}: {e}")
             raise
 
     async def get_hosts(self, scan_id: int) -> List[Dict[str, Any]]:

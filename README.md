@@ -15,6 +15,7 @@
 ##  Key Features
 - Async Scanning**: High-performance, asynchronous scanning engine for rapid target assessment.
 - Offline CVE Mapping**: Localized, signature-based vulnerability detection requiring no external API dependencies.
+- **🌐 Online CVE Lookup**: Resolves service banners and headers against the CIRCL Vulnerability-Lookup API for live CVE discovery.
 - Credentialed Audit Mode**: Supports SSH and WinRM for deep, authenticated configuration auditing.
 - HTML Reporting**: Automated, professional-grade executive reports in HTML format.
 - CLI Interface**: Intuitive command-line interface for seamless integration into automation workflows.
@@ -25,7 +26,17 @@
 
 ## Installation
 
-We recommend running SecAppliance in an isolated virtual environment to prevent dependency conflicts.
+SecAppliance **must** run inside a virtual environment. It is not optional:
+
+- The host Python is usually externally managed (PEP 668 on Debian/Ubuntu, and
+  `pip` is often absent entirely), so a global `pip install` fails or is refused.
+- `requirements.txt` pins exact versions; installing those over your system
+  packages can break other tools on the machine.
+- The pinned set requires Python 3.11+, which may differ from the system default.
+
+Every `python main.py` command further down assumes the environment below is
+active. If you prefer not to activate it, call the interpreter directly:
+`.venv/bin/python main.py ...` (Windows: `.venv\Scripts\python main.py ...`).
 
 1. Clone the repository:
    ```bash
@@ -36,15 +47,19 @@ We recommend running SecAppliance in an isolated virtual environment to prevent 
 2. Create and activate a virtual environment:
    ```bash
    # Linux / macOS
-   python3 -m venv venv
-   source venv/bin/activate
+   python3 -m venv .venv
+   source .venv/bin/activate
 
    # Windows (Command Prompt)
-   python -m venv venv
-   venv\Scripts\activate
+   python -m venv .venv
+   .venv\Scripts\activate
 
    # Windows (PowerShell)
-   .\venv\Scripts\Activate.ps1
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+
+   # Verify you are inside the environment before continuing:
+   python -c "import sys; print(sys.prefix)"
    ```
 
 3. Install dependencies:
@@ -130,6 +145,7 @@ This project underwent a rigorous 25-point architectural and security review. Al
 - **Performance**: Replaced per-row commits with batched transactions (`executemany`), reducing a /24 scan commit time from ~14.8s to ~1.8s. Added SQLite indexes for all report/host lookups.
 - **Report Accuracy**: CVE findings now affect the risk score and vulnerability counts. Fixed HSTS/Server header false positives. Derived ports (open but unconnected) are now explicitly labeled and no longer fabricated as active connections.
 - **Operations**: Data paths (DB, logs) moved to per-user OS directories (`platformdirs`). Requirements are strictly pinned. Dead code and unused dependencies removed.
+- **Online CVE Layer**: Added live CVE lookups via the CIRCL API with a 7-day SQLite cache, client-side version filtering, and dedicated report sections. Fixed connection mapping for remote unauthenticated hosts to correctly populate Derived Ports.
 
 ## Known Limitations
 - **Authenticated collection requires reachable services**: SSH/WinRM connection collection only succeeds when the target exposes those services and valid credentials are provided.

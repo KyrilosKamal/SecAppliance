@@ -80,6 +80,12 @@
                 </div>
                 <div class="kpi-divider"></div>
                 <div class="kpi-item">
+                    <div class="kpi-icon online-cves">🌐</div>
+                    <div class="kpi-value">{{ online_cves_count }}</div>
+                    <div class="kpi-label">Online CVEs (CIRCL)</div>
+                </div>
+                <div class="kpi-divider"></div>
+                <div class="kpi-item">
                     <div class="kpi-icon duration">⏱</div>
                     <div class="kpi-value">{{ scan_duration }}</div>
                     <div class="kpi-label">Scan Duration</div>
@@ -174,6 +180,40 @@
             </div>
             {% else %}
             <p>No CVE-related vulnerabilities detected based on service versions.</p>
+            {% endif %}
+        </section>
+
+        <!-- Online CVE Findings (CIRCL) -->
+        <section class="cve-details">
+            <h2 class="section-title">Online CVE Findings (CIRCL)</h2>
+            <p class="no-traffic-text">Product and version matches resolved online against the CIRCL Vulnerability-Lookup API. This is an additional layer; the offline signature mapping above remains authoritative.</p>
+            {% if online_cves %}
+            <div class="traffic-container">
+                <table class="traffic-table">
+                    <thead>
+                        <tr>
+                            <th>Host IP</th>
+                            <th>CVE ID</th>
+                            <th>Severity</th>
+                            <th>CVSS Score</th>
+                            <th>Summary</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for cve in online_cves %}
+                        <tr>
+                            <td>{{ cve.ip_address }}</td>
+                            <td>{{ cve.cve_id }}</td>
+                            <td><span class="severity-tag {{ cve.severity|lower }}">{{ cve.severity }}</span></td>
+                            <td>{{ '%.1f'|format(cve.cvss_score or 0) }}</td>
+                            <td>{{ cve.summary or 'No description available.' }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p>No online CVE findings.</p>
             {% endif %}
         </section>
 
