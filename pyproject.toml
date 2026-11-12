@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "secappliance"
-version = "2.1.0"
+version = "2.2.0"
 description = "Async network and web security scanner with offline and live CVE matching and HTML reporting"
 readme = "README.md"
 requires-python = ">=3.11"

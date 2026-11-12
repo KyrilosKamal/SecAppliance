@@ -1,3 +1,7 @@
+## 2.2.0
+
+- Version bump to 2.2.0.
+
 # Changelog
 
 ## 2.1.0
